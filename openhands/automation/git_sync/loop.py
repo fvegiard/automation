@@ -71,6 +71,7 @@ from openhands.automation.observability_associations import (
 )
 from openhands.automation.schemas import Trigger, validate_command_string
 from openhands.automation.storage import ObjectNotFoundError, get_file_store
+from openhands.automation.tags import normalize_tags
 from openhands.automation.utils import utcnow
 from openhands.automation.utils.model_profiles import validate_agent_profile_selection
 from openhands.automation.utils.periodic_loop import run_periodic_loop
@@ -82,6 +83,7 @@ from openhands.automation.utils.state import (
 from openhands.automation.utils.tarball_validation import (
     build_internal_url,
     build_upload_storage_path,
+    get_org_upload,
     is_valid_external_url,
     parse_internal_upload_id,
 )
@@ -330,10 +332,7 @@ async def _read_tarball_bytes(
     upload_id = parse_internal_upload_id(automation.tarball_path)
     if upload_id is None:
         return None
-    result = await session.execute(
-        select(TarballUpload).where(TarballUpload.id == upload_id)
-    )
-    upload = result.scalars().first()
+    upload = await get_org_upload(session, upload_id, automation.org_id)
     if upload is None:
         raise TarballUnavailableError(
             f"automation {automation.id} references missing upload {upload_id}"
@@ -402,7 +401,7 @@ async def _stored_tarball_matches(
 
 
 async def _delete_superseded_upload(
-    session: AsyncSession, tarball_path: str, pending_storage_deletes: list[str]
+    session: AsyncSession, automation: Automation, pending_storage_deletes: list[str]
 ) -> None:
     """Mark the upload an automation just stopped pointing at for removal.
 
@@ -416,13 +415,10 @@ async def _delete_superseded_upload(
     commit. Deleting before the commit destroyed the object irreversibly while
     a rollback revived the record, stranding it pointing at a missing object.
     """
-    upload_id = parse_internal_upload_id(tarball_path)
+    upload_id = parse_internal_upload_id(automation.tarball_path)
     if upload_id is None:
         return
-    result = await session.execute(
-        select(TarballUpload).where(TarballUpload.id == upload_id)
-    )
-    upload = result.scalars().first()
+    upload = await get_org_upload(session, upload_id, automation.org_id)
     if upload is None or upload.deleted_at is not None:
         return
 
@@ -470,9 +466,7 @@ async def _resolve_tarball_path(
             slug,
         )
         if existing is not None:
-            await _delete_superseded_upload(
-                session, existing.tarball_path, pending_storage_deletes
-            )
+            await _delete_superseded_upload(session, existing, pending_storage_deletes)
         return new_path
 
     tarball_source = fields.get("tarball_source") or {}
@@ -513,6 +507,11 @@ async def _validate_and_resolve_fields(
     observability_associations = validate_observability_associations(
         fields.get("observability_associations")
     )
+    # Export omits an empty list, so a missing key means no tags.
+    raw_tags = fields.get("tags") or []
+    if not isinstance(raw_tags, list):
+        raise ValueError("automation.yaml 'tags' must be a list")
+    tags = normalize_tags(raw_tags)
     entrypoint = validate_command_string(raw_entrypoint, "entrypoint", allow_none=False)
     setup_script_path = validate_command_string(
         fields.get("setup_script_path"), "setup_script_path"
@@ -557,6 +556,7 @@ async def _validate_and_resolve_fields(
         "agent_profile_id": agent_profile_id,
         "trigger": trigger.model_dump(),
         "observability_associations": observability_associations,
+        "tags": tags,
         "entrypoint": entrypoint,
         "setup_script_path": setup_script_path,
         "timeout": timeout,

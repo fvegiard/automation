@@ -36,7 +36,6 @@ from openhands.automation.models import (
     AutomationRun,
     AutomationRunStatus,
     AutomationState as ModelAutomationState,
-    TarballUpload,
 )
 from openhands.automation.observability import (
     add_event,
@@ -65,6 +64,8 @@ from openhands.automation.schemas import (
     AutomationResponse,
     AutomationRunListResponse,
     AutomationRunResponse,
+    AutomationTagCount,
+    AutomationTagsResponse,
     CreateAutomationRequest,
     EventTrigger,
     RunCompleteRequest,
@@ -72,6 +73,7 @@ from openhands.automation.schemas import (
     UpdateAutomationRequest,
 )
 from openhands.automation.storage import FileStore, get_file_store
+from openhands.automation.tags import normalize_tag
 from openhands.automation.telemetry import (
     capture_automation_event,
     get_request_telemetry_context,
@@ -105,7 +107,9 @@ from openhands.automation.utils.state import (
     automation_state_enabled,
     model_automation_state,
 )
+from openhands.automation.utils.tags import count_org_tags, has_tag
 from openhands.automation.utils.tarball_validation import (
+    get_org_upload,
     is_http_url,
     parse_internal_upload_id,
     validate_tarball_path,
@@ -289,6 +293,7 @@ async def create_automation(
         preset_metadata=preset_metadata,
         trigger=body.trigger.model_dump(),
         observability_associations=body.observability_associations,
+        tags=body.tags,
         tarball_path=body.tarball_path,
         setup_script_path=body.setup_script_path,
         entrypoint=body.entrypoint,
@@ -625,6 +630,9 @@ async def list_automations(
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     created_by: Literal["me", "others"] | None = Query(default=None),
+    tag: str | None = Query(
+        default=None, description="Only automations carrying this tag"
+    ),
     user: AuthenticatedUser = Depends(_require_view_automations),
     session: AsyncSession = Depends(get_session, scope="function"),
 ) -> AutomationListResponse:
@@ -637,6 +645,13 @@ async def list_automations(
         base_query = base_query.where(Automation.user_id == user.user_id)
     elif created_by == "others":
         base_query = base_query.where(Automation.user_id != user.user_id)
+    if tag is not None:
+        try:
+            base_query = base_query.where(has_tag(normalize_tag(tag)))
+        except ValueError as exc:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+            ) from exc
 
     count_result = await session.execute(
         select(func.count()).select_from(base_query.subquery())
@@ -655,6 +670,19 @@ async def list_automations(
     return AutomationListResponse(
         automations=[AutomationResponse.model_validate(a) for a in automations],
         total=total,
+    )
+
+
+# Before /{automation_id}, which would otherwise take "tags" as an id.
+@router.get("/tags")
+async def list_automation_tags(
+    user: AuthenticatedUser = Depends(_require_view_automations),
+    session: AsyncSession = Depends(get_session, scope="function"),
+) -> AutomationTagsResponse:
+    """Tags on the caller's org's live automations, most-used first."""
+    counts = await count_org_tags(session, user.org_id)
+    return AutomationTagsResponse(
+        tags=[AutomationTagCount(tag=tag, count=count) for tag, count in counts]
     )
 
 
@@ -688,6 +716,20 @@ async def update_automation(
 
     update_data = body.model_dump(exclude_unset=True)
     _assert_can_update_fields(auto, user, update_data)
+    # Same ownership check as create. Only a new value is checked: resending the
+    # stored path cannot grant anything the row does not already have, and that
+    # upload need not be owned by the editor or still be live.
+    requested_tarball_path = update_data.get("tarball_path")
+    if (
+        requested_tarball_path is not None
+        and requested_tarball_path != auto.tarball_path
+    ):
+        await validate_tarball_path(
+            tarball_path=requested_tarball_path,
+            user_id=user.user_id,
+            org_id=user.org_id,
+            session=session,
+        )
     # Repositories are not a column: a preset bakes them into its tarball and
     # records them in preset_metadata, so they are applied with the prompt below.
     repos_requested = "repos" in update_data
@@ -994,14 +1036,8 @@ async def download_automation_tarball(
 
     upload_id = parse_internal_upload_id(auto.tarball_path)
     if upload_id is not None:
-        result = await session.execute(
-            select(TarballUpload).where(
-                TarballUpload.id == upload_id,
-                TarballUpload.deleted_at.is_(None),
-            )
-        )
-        upload = result.scalars().first()
-        if upload is None:
+        upload = await get_org_upload(session, upload_id, auto.org_id)
+        if upload is None or upload.deleted_at is not None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Tarball not found (underlying upload may have been deleted)",

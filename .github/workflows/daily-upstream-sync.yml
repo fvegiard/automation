@@ -1,14 +1,17 @@
 name: Daily upstream sync
+
 on:
   schedule:
     - cron: '23 9 * * *'
   workflow_dispatch:
+
 permissions:
   contents: write
-  workflow: write
+
 concurrency:
   group: daily-upstream-sync
   cancel-in-progress: false
+
 jobs:
   sync:
     if: github.repository_owner == 'fvegiard'

@@ -4,6 +4,7 @@ Uses an in-memory SQLite engine and a real bare repo under tmp_path, not mocks.
 """
 
 import asyncio
+import base64
 import io
 import logging
 import subprocess
@@ -13,6 +14,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
+import yaml
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -52,9 +54,11 @@ from openhands.automation.models import (
     AutomationGitSyncState,
     AutomationState,
     Base,
+    CustomWebhook,
     TarballUpload,
     UploadStatus,
 )
+from openhands.automation.schemas import CONTINUE_CONVERSATION_KEEP_ALIVE_ERROR
 from openhands.automation.storage.local import LocalFileStore
 from openhands.automation.utils import utcnow
 from openhands.automation.utils.tarball_validation import parse_internal_upload_id
@@ -69,6 +73,67 @@ LOCAL_ORG_ID = _LOCAL_USER.org_id
 
 async def _aiter(data: bytes):
     yield data
+
+
+async def test_import_rejects_continuation_on_deadline_webhook(
+    sqlite_session_factory, file_store, git_settings, service_settings, origin, caplog
+):
+    automation_id = await _create_internal_automation(
+        sqlite_session_factory, file_store
+    )
+    async with sqlite_session_factory() as session:
+        automation = await session.get(Automation, automation_id)
+        assert automation is not None
+        original_trigger = dict(automation.trigger)
+        session.add(
+            CustomWebhook(
+                org_id=LOCAL_ORG_ID,
+                name="Synthetic Teams source",
+                source="teams-demo",
+                webhook_secret=base64.b64encode(b"synthetic-git-sync-token").decode(),
+                signature_scheme="teams_hmac_sha256",
+                signature_header="Authorization",
+                acknowledgement="teams_message",
+                event_id_expr="id",
+                admission_expr="allowed",
+            )
+        )
+        await session.commit()
+    await run_sync_cycle(
+        sqlite_session_factory, LOCAL_ORG_ID, git_settings, service_settings
+    )
+    editor = origin.parent / "guard-editor"
+    await ensure_repo(editor, f"file://{origin}", "main", "", 30)
+    await pull(editor, "main", "", 30)
+    path = editor / "automations" / "my-first-automation" / "automation.yaml"
+    data = yaml.safe_load(path.read_text())
+    data["trigger"] = {
+        "type": "event",
+        "source": "teams-demo",
+        "on": "message",
+        "destination": "continue_conversation",
+        "subject_key_expr": "id",
+    }
+    data["keep_alive"] = True
+    path.write_text(yaml.safe_dump(data, sort_keys=False))
+    await commit_and_push(
+        editor,
+        "automations",
+        "Synthetic continuation edit",
+        "Synthetic",
+        "synthetic@example.com",
+        "main",
+        "",
+        30,
+    )
+    result = await run_sync_cycle(
+        sqlite_session_factory, LOCAL_ORG_ID, git_settings, service_settings
+    )
+    assert result.imported == 0
+    assert "Deadline-bound" in caplog.text
+    async with sqlite_session_factory() as session:
+        automation = await session.get(Automation, automation_id)
+        assert automation is not None and automation.trigger == original_trigger
 
 
 async def _org_config(
@@ -2669,6 +2734,66 @@ class TestImportedAutomationDefaults:
         assert update_logs
         assert "Repo Writer <writer@example.com>" in update_logs[0]
 
+    _CONTINUING_YAML = (
+        "name: Hand Written\n"
+        "entrypoint: python main.py\n"
+        "trigger:\n"
+        "  type: event\n"
+        "  source: qa-src\n"
+        "  'on': qa.*\n"
+        "  destination: continue_conversation\n"
+        "  subject_key_expr: id\n"
+    )
+
+    async def test_continuing_import_without_keep_alive_is_kept_alive(
+        self, sqlite_session_factory, git_settings, service_settings, origin
+    ):
+        """Git sync applies the `continue_conversation` rule the API does."""
+        await self._push_hand_written(origin, self._CONTINUING_YAML)
+
+        result = await self._cycle(
+            sqlite_session_factory, git_settings, service_settings
+        )
+
+        assert result.imported == 1
+        async with sqlite_session_factory() as session:
+            automation = (await session.execute(select(Automation))).scalars().one()
+        assert automation.keep_alive is True
+
+    async def test_continuing_import_with_keep_alive_false_is_skipped(
+        self, sqlite_session_factory, git_settings, service_settings, origin, caplog
+    ):
+        await self._push_hand_written(
+            origin, self._CONTINUING_YAML + "keep_alive: false\n"
+        )
+
+        result = await self._cycle(
+            sqlite_session_factory, git_settings, service_settings
+        )
+
+        assert result.imported == 0
+        assert CONTINUE_CONVERSATION_KEEP_ALIVE_ERROR in caplog.text
+        async with sqlite_session_factory() as session:
+            assert (await session.execute(select(Automation))).first() is None
+
+    async def test_continuing_update_with_keep_alive_false_is_skipped(
+        self, sqlite_session_factory, git_settings, service_settings, origin
+    ):
+        await self._push_hand_written(origin, self._CONTINUING_YAML)
+        await self._cycle(sqlite_session_factory, git_settings, service_settings)
+
+        await self._push_hand_written(
+            origin,
+            self._CONTINUING_YAML.replace("main.py", "main.py --flag")
+            + "keep_alive: false\n",
+        )
+        await self._cycle(sqlite_session_factory, git_settings, service_settings)
+
+        async with sqlite_session_factory() as session:
+            automation = (await session.execute(select(Automation))).scalars().one()
+        assert automation.entrypoint == "python main.py"
+        assert automation.keep_alive is True
+
 
 class TestFailureBackoffState:
     """The per-org auth-failure streak that drives backoff and quiet logging.
@@ -2773,3 +2898,209 @@ class TestFailureBackoffState:
         assert row.consecutive_auth_failures == 0
         assert row.last_error is None
         assert row.last_error_at is None
+
+
+class TestPluginSpecSync:
+    @pytest.mark.parametrize("working_dir", [".", "scripts"])
+    async def test_config_edits_round_trip_and_restore(
+        self,
+        sqlite_session_factory,
+        git_settings,
+        service_settings,
+        origin,
+        tmp_path,
+        working_dir,
+    ):
+        import yaml
+
+        from openhands.automation.plugin_specs import (
+            AutomationPluginEntrypoint,
+            AutomationPluginManifest,
+            entrypoint_for_manifest,
+        )
+
+        manifest = AutomationPluginManifest(
+            name="reviewer",
+            schema_version="openhands.automation.plugin.v1",
+            entrypoint=AutomationPluginEntrypoint(
+                command="python worker.py", working_dir=working_dir
+            ),
+        )
+        entrypoint = entrypoint_for_manifest(manifest)
+
+        spec = {
+            "plugin": {
+                "source": "github:OpenHands/extensions",
+                "ref": "abc123",
+                "repo_path": "plugins/reviewer",
+            },
+            "config": {"repos": ["OpenHands/OpenHands"]},
+            "required_plugins": [{"source": "github:OpenHands/tools", "ref": "def456"}],
+        }
+        async with sqlite_session_factory() as session:
+            automation = Automation(
+                user_id=LOCAL_USER_ID,
+                org_id=LOCAL_ORG_ID,
+                name="Plugin reviewer",
+                trigger={"type": "cron", "schedule": "0 * * * *"},
+                tarball_path="plugin-spec://runtime",
+                entrypoint=entrypoint,
+                plugin_spec=spec,
+                enabled=False,
+                state=AutomationState.INACTIVE,
+            )
+            session.add(automation)
+            await session.commit()
+            automation_id = automation.id
+        first = await run_sync_cycle(
+            sqlite_session_factory, LOCAL_ORG_ID, git_settings, service_settings
+        )
+        assert first.pushed_commit
+        async with sqlite_session_factory() as session:
+            automation = await session.get(Automation, automation_id)
+            automation.plugin_spec = {
+                **spec,
+                "config": {"repos": ["OpenHands/OpenHands", "OpenHands/docs"]},
+            }
+            await mark_git_sync_dirty(session, automation)
+            await session.commit()
+        second = await run_sync_cycle(
+            sqlite_session_factory, LOCAL_ORG_ID, git_settings, service_settings
+        )
+        assert second.pushed_commit and second.pushed_commit != first.pushed_commit
+        editor = tmp_path / "editor"
+        await ensure_repo(editor, f"file://{origin}", "main", "", 30)
+        yaml_path = editor / "automations/plugin-reviewer/automation.yaml"
+        fields = yaml.safe_load(yaml_path.read_text())
+        assert fields["plugin_spec"]["config"]["repos"] == [
+            "OpenHands/OpenHands",
+            "OpenHands/docs",
+        ]
+        assert fields["plugin_spec"]["required_plugins"] == spec["required_plugins"]
+        fields["plugin_spec"]["config"]["repos"].append("OpenHands/automation")
+        yaml_path.write_text(yaml.safe_dump(fields))
+        await commit_and_push(
+            editor,
+            "automations",
+            "Edit plugin config",
+            "Human",
+            "human@example.com",
+            "main",
+            "",
+            30,
+        )
+        await run_sync_cycle(
+            sqlite_session_factory, LOCAL_ORG_ID, git_settings, service_settings
+        )
+        async with sqlite_session_factory() as session:
+            automation = await session.get(Automation, automation_id)
+            assert automation.plugin_spec == fields["plugin_spec"]
+            assert automation.enabled is False
+            assert automation.tarball_path == "plugin-spec://runtime"
+
+        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/restored.db")
+        try:
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+            restored_factory = async_sessionmaker(engine, expire_on_commit=False)
+            restored_settings = git_settings.model_copy(
+                update={"git_sync_local_workdir": str(tmp_path / "restored")}
+            )
+            result = await run_sync_cycle(
+                restored_factory, LOCAL_ORG_ID, restored_settings, service_settings
+            )
+            assert result.imported == 1
+            async with restored_factory() as session:
+                restored = (await session.execute(select(Automation))).scalar_one()
+                assert restored.plugin_spec == fields["plugin_spec"]
+                assert restored.entrypoint == entrypoint
+        finally:
+            await engine.dispose()
+
+    async def test_repairs_legacy_export_and_rejects_invalid_import_atomically(
+        self, sqlite_session_factory, git_settings, service_settings, origin, tmp_path
+    ):
+        import yaml
+
+        spec = {
+            "plugin": {"source": "github:OpenHands/extensions"},
+            "config": {"repos": ["OpenHands/docs"]},
+        }
+        async with sqlite_session_factory() as session:
+            automation = Automation(
+                user_id=LOCAL_USER_ID,
+                org_id=LOCAL_ORG_ID,
+                name="Legacy plugin",
+                trigger={"type": "cron", "schedule": "0 * * * *"},
+                tarball_path="plugin-spec://runtime",
+                entrypoint="python worker.py",
+                plugin_spec=spec,
+                enabled=False,
+                state=AutomationState.INACTIVE,
+            )
+            session.add(automation)
+            await session.commit()
+            automation_id = automation.id
+        await run_sync_cycle(
+            sqlite_session_factory, LOCAL_ORG_ID, git_settings, service_settings
+        )
+        editor = tmp_path / "editor"
+        await ensure_repo(editor, f"file://{origin}", "main", "", 30)
+        yaml_path = editor / "automations/legacy-plugin/automation.yaml"
+        fields = yaml.safe_load(yaml_path.read_text())
+        del fields["plugin_spec"]
+        yaml_path.write_text(yaml.safe_dump(fields))
+        await commit_and_push(
+            editor,
+            "automations",
+            "Old exporter",
+            "Human",
+            "human@example.com",
+            "main",
+            "",
+            30,
+        )
+        repaired = await run_sync_cycle(
+            sqlite_session_factory, LOCAL_ORG_ID, git_settings, service_settings
+        )
+        assert repaired.pushed_commit
+        await pull(editor, "main", "", 30)
+        fields = yaml.safe_load(yaml_path.read_text())
+        assert fields["plugin_spec"] == spec
+        fields["name"] = "Invalid edit must not apply"
+        fields["plugin_spec"]["config"] = ["not an object"]
+        yaml_path.write_text(yaml.safe_dump(fields))
+        await commit_and_push(
+            editor,
+            "automations",
+            "Invalid config",
+            "Human",
+            "human@example.com",
+            "main",
+            "",
+            30,
+        )
+        await run_sync_cycle(
+            sqlite_session_factory, LOCAL_ORG_ID, git_settings, service_settings
+        )
+        async with sqlite_session_factory() as session:
+            automation = await session.get(Automation, automation_id)
+            assert automation.name == "Legacy plugin"
+            assert automation.plugin_spec == spec
+
+
+@pytest.mark.parametrize(
+    "entrypoint",
+    [
+        'cd "$AUTOMATION_PLUGIN_ROOT/../outside" && python worker.py',
+        'cd "$AUTOMATION_PLUGIN_ROOT" && python worker.py; touch owned',
+        'cd "$AUTOMATION_PLUGIN_ROOT" && $(touch owned)',
+    ],
+)
+def test_synced_plugin_entrypoint_rejects_unsafe_wrappers(entrypoint):
+    from openhands.automation.git_sync.plugin_spec import (
+        validate_synced_plugin_entrypoint,
+    )
+
+    with pytest.raises(ValueError):
+        validate_synced_plugin_entrypoint(entrypoint)

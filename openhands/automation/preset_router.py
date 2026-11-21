@@ -38,6 +38,11 @@ from openhands.automation.auth import (
 from openhands.automation.config import get_config
 from openhands.automation.constants import MODEL_PROFILE_PATTERN
 from openhands.automation.db import get_session
+from openhands.automation.factory_router import (
+    authorize_factory_for_create,
+    lock_factory_for_assignment,
+    reject_factory_conflict,
+)
 from openhands.automation.git_sync import mark_git_sync_dirty
 from openhands.automation.models import (
     Automation,
@@ -48,26 +53,37 @@ from openhands.automation.models import (
 from openhands.automation.observability_associations import (
     validate_observability_associations as validate_observability_association_exprs,
 )
+from openhands.automation.plugin_secrets import preflight_secret_lookup
 from openhands.automation.plugin_specs import (
+    PluginSecretLookup,
     PluginSpecError,
+    no_plugin_secrets,
     pin_plugin_refs,
 )
 from openhands.automation.schemas import (
+    FACTORY_ID_DESCRIPTION,
     RUN_AS_USER_ID_DESCRIPTION,
     AutomationResponse,
     PublicAutomationState,
     TemplateProvenance,
     Trigger,
+    continue_conversation_keep_alive,
     normalize_automation_state_enabled,
     reject_public_draft_state,
 )
 from openhands.automation.storage import FileStore, ObjectNotFoundError, get_file_store
 from openhands.automation.telemetry import (
+    automation_created_event,
+    automation_created_properties,
     capture_automation_event,
     get_request_telemetry_context,
 )
 from openhands.automation.utils import utcnow
-from openhands.automation.utils.model_profiles import resolve_model_profile_for_user
+from openhands.automation.utils.model_profiles import (
+    ensure_agent_profile_exists,
+    resolve_model_profile_for_user,
+    validate_agent_profile_combination,
+)
 from openhands.automation.utils.run_as import (
     require_automation_creator,
     resolve_run_as,
@@ -91,6 +107,7 @@ from openhands.automation.utils.timeout import (
     default_automation_timeout,
     validate_automation_timeout,
 )
+from openhands.automation.webhook_policy import require_compatible_trigger
 from openhands.sdk.plugin import PluginSource
 from openhands.workspace import RepoSource
 
@@ -102,6 +119,7 @@ router = APIRouter(prefix="/v1/preset", tags=["Presets"])
 # Preset files directories
 PRESETS_DIR = Path(__file__).parent / "presets"
 SHARED_FINISH_TOOL_HOOK = PRESETS_DIR / "finish_tool_hook.py"
+SHARED_SETUP_PY = PRESETS_DIR / "setup.py"
 PROMPT_PRESET_DIR = PRESETS_DIR / "prompt"
 PLUGIN_PRESET_DIR = PRESETS_DIR / "plugin"
 
@@ -132,6 +150,7 @@ def _load_prompt_preset_files() -> dict[str, str]:
         _PROMPT_PRESET_CACHE = {
             "main.py": (PROMPT_PRESET_DIR / "sdk_main.py").read_text(),
             "setup.sh": (PROMPT_PRESET_DIR / "setup.sh").read_text(),
+            "setup.py": SHARED_SETUP_PY.read_text(),
             "finish_tool_hook.py": SHARED_FINISH_TOOL_HOOK.read_text(),
         }
     return _PROMPT_PRESET_CACHE
@@ -147,6 +166,7 @@ def _load_plugin_preset_files() -> dict[str, str]:
         _PLUGIN_PRESET_CACHE = {
             "main.py": (PLUGIN_PRESET_DIR / "sdk_main.py").read_text(),
             "setup.sh": (PLUGIN_PRESET_DIR / "setup.sh").read_text(),
+            "setup.py": SHARED_SETUP_PY.read_text(),
             "finish_tool_hook.py": SHARED_FINISH_TOOL_HOOK.read_text(),
         }
     return _PLUGIN_PRESET_CACHE
@@ -171,8 +191,18 @@ class CreatePromptAutomationRequest(BaseModel):
     run_as_user_id: uuid.UUID | None = Field(
         default=None, description=RUN_AS_USER_ID_DESCRIPTION
     )
+    agent_profile_id: uuid.UUID | None = Field(
+        default=None,
+        description=(
+            "Agent profile the runs launch from. It owns the model, so it "
+            "cannot be combined with 'model'."
+        ),
+    )
 
     name: str = Field(..., min_length=1, max_length=500)
+    factory_id: uuid.UUID | None = Field(
+        default=None, description=FACTORY_ID_DESCRIPTION
+    )
     description: str | None = Field(default=None, max_length=2000)
     prompt: str = Field(
         ...,
@@ -274,6 +304,15 @@ class CreatePromptAutomationRequest(BaseModel):
                 data["repos"] = [repos]
         return data
 
+    @model_validator(mode="after")
+    def keep_alive_for_continued_conversations(
+        self,
+    ) -> "CreatePromptAutomationRequest":
+        self.keep_alive = continue_conversation_keep_alive(
+            self.trigger, self.keep_alive
+        )
+        return self
+
 
 def _add_file_to_tar(
     tar: tarfile.TarFile, name: str, content: str, mode: int = 0o644
@@ -284,6 +323,18 @@ def _add_file_to_tar(
     info.size = len(content_bytes)
     info.mode = mode
     tar.addfile(info, io.BytesIO(content_bytes))
+
+
+def _add_setup_scripts(tar: tarfile.TarFile, preset_files: dict[str, str]) -> None:
+    """Add the preset setup scripts to *tar*.
+
+    A Windows agent server runs commands with cmd.exe and has no POSIX shell
+    for ``setup.sh``, so tarballs created on Windows also carry ``setup.py``,
+    which the Windows runner prefers.
+    """
+    _add_file_to_tar(tar, "setup.sh", preset_files["setup.sh"], mode=0o755)
+    if os.name == "nt":
+        _add_file_to_tar(tar, "setup.py", preset_files["setup.py"])
 
 
 def _generate_tarball(prompt: str, repos: list[RepoSource] | None = None) -> bytes:
@@ -315,7 +366,7 @@ def _generate_tarball(prompt: str, repos: list[RepoSource] | None = None) -> byt
             tar, "finish_tool_hook.py", preset_files["finish_tool_hook.py"]
         )
         _add_file_to_tar(tar, "prompt.txt", prompt)
-        _add_file_to_tar(tar, "setup.sh", preset_files["setup.sh"], mode=0o755)
+        _add_setup_scripts(tar, preset_files)
 
         # Add repos config if repos specified (SDK workspace handles cloning)
         if repos:
@@ -390,6 +441,51 @@ def _replace_files_in_tarball(
 
     out_buffer.seek(0)
     return out_buffer.read()
+
+
+# Every preset runner, back to the first release, opens with one of these lines.
+_PRESET_RUNNER_KINDS = (
+    (b'"""Prompt-based automation script', "prompt"),
+    (b'"""Plugin-based automation script', "plugin"),
+)
+
+
+def with_current_preset_runner(tarball_bytes: bytes) -> bytes:
+    """Return a preset tarball with the current runner, else the tarball unchanged.
+
+    A preset tarball bakes the service's runner (``main.py``, ``setup.sh`` and
+    ``finish_tool_hook.py``) next to the user's content (``prompt.txt`` and the
+    repository or plugin configuration) when the automation is created. The
+    runner has to match the service that dispatches it, so every run gets the
+    current one; the stored tarball is not rewritten. A tarball that is not a
+    preset (no ``prompt.txt``, or a ``main.py`` that is not a preset runner) is
+    returned as is.
+
+    On Windows the run also gets ``setup.py`` (see ``_add_setup_scripts``), so
+    a preset created before the service shipped it still runs there.
+    """
+    try:
+        with tarfile.open(fileobj=io.BytesIO(tarball_bytes), mode="r:gz") as tar:
+            names = set(tar.getnames())
+            if "prompt.txt" not in names or "main.py" not in names:
+                return tarball_bytes
+            member = tar.extractfile("main.py")
+            head = member.read(64) if member is not None else b""
+    except (tarfile.TarError, OSError, EOFError):
+        return tarball_bytes
+    kind = next(
+        (kind for prefix, kind in _PRESET_RUNNER_KINDS if head.startswith(prefix)),
+        None,
+    )
+    if kind is None:
+        return tarball_bytes
+    files = dict(
+        _load_prompt_preset_files() if kind == "prompt" else _load_plugin_preset_files()
+    )
+    if os.name != "nt":
+        # A missing file is added, and only a Windows agent server uses setup.py.
+        del files["setup.py"]
+    return _replace_files_in_tarball(tarball_bytes, files) or tarball_bytes
 
 
 def _delete_storage_object_best_effort(
@@ -553,18 +649,31 @@ async def create_automation_from_prompt(
     5. Execute the provided prompt
     6. Report completion status back to the automation service
     """
+    validate_agent_profile_combination(body.agent_profile_id, body.model)
+    await authorize_factory_for_create(session, user, body.factory_id)
+
     # Idempotent creation: enabling the same extension template twice returns
     # the existing automation unchanged instead of creating a duplicate.
     if body.template is not None:
         existing = await find_existing_template_automation(
-            session, user.org_id, body.template.id
+            session, user.org_id, user.user_id, body.template.id
         )
         if existing is not None:
+            reject_factory_conflict(existing, body.factory_id)
             response.status_code = status.HTTP_200_OK
             return AutomationResponse.model_validate(existing)
 
+    await require_compatible_trigger(user.org_id, body.trigger.model_dump(), session)
+
+    await ensure_agent_profile_exists(
+        body.agent_profile_id, request, user, runs_as_user_id=body.run_as_user_id
+    )
     run_as = await resolve_run_as(body.run_as_user_id, user, get_http_client(request))
-    model = resolve_model_profile_for_user(body.model, user)
+    model = (
+        None
+        if body.agent_profile_id
+        else resolve_model_profile_for_user(body.model, user)
+    )
     state = model_automation_state(body.state, body.enabled)
 
     # 1. Generate tarball with SDK code, prompt, and optional repos config
@@ -622,6 +731,7 @@ async def create_automation_from_prompt(
         preset_metadata["template"] = body.template.model_dump(exclude_none=True)
 
     try:
+        await lock_factory_for_assignment(session, user.org_id, body.factory_id)
         automation = Automation(
             user_id=run_as.user_id,
             run_as_kind=run_as.kind,
@@ -630,8 +740,10 @@ async def create_automation_from_prompt(
             name=body.name,
             description=body.description,
             prompt=body.prompt,
+            factory_id=body.factory_id,
             preset_metadata=preset_metadata,
             model=model,
+            agent_profile_id=body.agent_profile_id,
             trigger=body.trigger.model_dump(),
             observability_associations=body.observability_associations,
             tarball_path=tarball_path,
@@ -649,12 +761,11 @@ async def create_automation_from_prompt(
         await session.flush()
         await session.refresh(automation)
         await mark_git_sync_dirty(session, automation)
+    except HTTPException:
+        _delete_storage_object_best_effort(file_store, storage_path)
+        raise
     except Exception as e:
-        # Clean up orphaned upload on automation creation failure
-        try:
-            file_store.delete(storage_path)
-        except Exception:
-            logger.exception("Failed to clean up orphaned upload at %s", storage_path)
+        _delete_storage_object_best_effort(file_store, storage_path)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to create automation: {e!s}",
@@ -672,8 +783,9 @@ async def create_automation_from_prompt(
     if body.template is not None:
         creation_properties["template_id"] = body.template.id
         creation_properties["template_version"] = body.template.version
+    creation_properties.update(await automation_created_properties(session, automation))
     await capture_automation_event(
-        "automation_created",
+        automation_created_event(),
         request=request,
         user=user,
         automation=automation,
@@ -720,8 +832,18 @@ class CreatePluginAutomationRequest(BaseModel):
     run_as_user_id: uuid.UUID | None = Field(
         default=None, description=RUN_AS_USER_ID_DESCRIPTION
     )
+    agent_profile_id: uuid.UUID | None = Field(
+        default=None,
+        description=(
+            "Agent profile the runs launch from. It owns the model, so it "
+            "cannot be combined with 'model'."
+        ),
+    )
 
     name: str = Field(..., min_length=1, max_length=500)
+    factory_id: uuid.UUID | None = Field(
+        default=None, description=FACTORY_ID_DESCRIPTION
+    )
     description: str | None = Field(default=None, max_length=2000)
     plugins: list[PluginSource] | None = Field(
         default=None,
@@ -858,6 +980,8 @@ class CreatePluginAutomationRequest(BaseModel):
         """Enforce mutual exclusivity between plugins and variants."""
         if (self.plugins is None) == (self.variants is None):
             raise ValueError("Exactly one of 'plugins' or 'variants' must be provided.")
+        if self.variants is not None and self.agent_profile_id is not None:
+            raise ValueError("'agent_profile_id' cannot be used with 'variants'.")
 
         if self.variants is not None:
             if self.experiment_id is None:
@@ -875,6 +999,15 @@ class CreatePluginAutomationRequest(BaseModel):
                     "'experiment_id' can only be used with 'variants', not 'plugins'."
                 )
 
+        return self
+
+    @model_validator(mode="after")
+    def keep_alive_for_continued_conversations(
+        self,
+    ) -> "CreatePluginAutomationRequest":
+        self.keep_alive = continue_conversation_keep_alive(
+            self.trigger, self.keep_alive
+        )
         return self
 
 
@@ -906,32 +1039,37 @@ def _resolve_experiment_variant_models(
     ]
 
 
-def _pin_preset_plugin_refs(
+async def _pin_preset_plugin_refs(
     body: CreatePluginAutomationRequest,
+    secrets: PluginSecretLookup = no_plugin_secrets,
 ) -> CreatePluginAutomationRequest:
     """Return ``body`` with every plugin ref (variants too) pinned to its commit.
 
     The generated tarball stores the refs as given, so an automation that runs
-    as a service account stores SHAs (see ``pin_plugin_refs``).
+    as a service account stores SHAs (see ``pin_plugin_refs``). A private
+    source is read with ``secrets``, those of the service account.
 
     Raises:
         HTTPException: 422 when a ref cannot be resolved to a commit SHA.
     """
     allow_local_sources = get_config().service.is_local_mode
 
-    def pin(plugins: list[PluginSource]) -> list[PluginSource]:
-        pinned = pin_plugin_refs(
+    async def pin(plugins: list[PluginSource]) -> list[PluginSource]:
+        pinned = await pin_plugin_refs(
             [p.model_dump(exclude_none=True) for p in plugins],
             allow_local_sources=allow_local_sources,
+            secrets=secrets,
         )
         return [PluginSource.model_validate(item) for item in pinned]
 
     try:
         return body.model_copy(
             update={
-                "plugins": pin(body.plugins) if body.plugins is not None else None,
+                "plugins": await pin(body.plugins)
+                if body.plugins is not None
+                else None,
                 "variants": [
-                    v.model_copy(update={"plugins": pin(v.plugins)})
+                    v.model_copy(update={"plugins": await pin(v.plugins)})
                     for v in body.variants
                 ]
                 if body.variants is not None
@@ -967,7 +1105,7 @@ def _generate_plugin_tarball(
             tar, "finish_tool_hook.py", preset_files["finish_tool_hook.py"]
         )
         _add_file_to_tar(tar, "prompt.txt", prompt)
-        _add_file_to_tar(tar, "setup.sh", preset_files["setup.sh"], mode=0o755)
+        _add_setup_scripts(tar, preset_files)
 
         if variants is not None:
             experiment_config = {
@@ -1040,20 +1178,38 @@ async def create_automation_from_plugin(
     - With ref: branch, tag, or commit SHA
     - With repo_path: subdirectory for monorepos
     """
+    validate_agent_profile_combination(body.agent_profile_id, body.model)
+    await authorize_factory_for_create(session, user, body.factory_id)
+
     # Idempotent creation: enabling the same extension template twice returns
     # the existing automation unchanged instead of creating a duplicate.
     if body.template is not None:
         existing = await find_existing_template_automation(
-            session, user.org_id, body.template.id
+            session, user.org_id, user.user_id, body.template.id
         )
         if existing is not None:
+            reject_factory_conflict(existing, body.factory_id)
             response.status_code = status.HTTP_200_OK
             return AutomationResponse.model_validate(existing)
 
+    await require_compatible_trigger(user.org_id, body.trigger.model_dump(), session)
+
+    await ensure_agent_profile_exists(
+        body.agent_profile_id, request, user, runs_as_user_id=body.run_as_user_id
+    )
     run_as = await resolve_run_as(body.run_as_user_id, user, get_http_client(request))
     if run_as.kind == AutomationRunAsKind.SERVICE:
-        body = _pin_preset_plugin_refs(body)
-    model = resolve_model_profile_for_user(body.model, user)
+        body = await _pin_preset_plugin_refs(
+            body,
+            preflight_secret_lookup(
+                get_http_client(request), user_id=run_as.user_id, org_id=user.org_id
+            ),
+        )
+    model = (
+        None
+        if body.agent_profile_id
+        else resolve_model_profile_for_user(body.model, user)
+    )
     state = model_automation_state(body.state, body.enabled)
     variants = _resolve_experiment_variant_models(
         body.variants, user, default_model=model
@@ -1134,6 +1290,7 @@ async def create_automation_from_plugin(
         preset_metadata["template"] = body.template.model_dump(exclude_none=True)
 
     try:
+        await lock_factory_for_assignment(session, user.org_id, body.factory_id)
         automation = Automation(
             user_id=run_as.user_id,
             run_as_kind=run_as.kind,
@@ -1142,8 +1299,10 @@ async def create_automation_from_plugin(
             name=body.name,
             description=body.description,
             prompt=body.prompt,
+            factory_id=body.factory_id,
             preset_metadata=preset_metadata,
             model=model,
+            agent_profile_id=body.agent_profile_id,
             trigger=body.trigger.model_dump(),
             observability_associations=body.observability_associations,
             tarball_path=tarball_path,
@@ -1161,12 +1320,11 @@ async def create_automation_from_plugin(
         await session.flush()
         await session.refresh(automation)
         await mark_git_sync_dirty(session, automation)
+    except HTTPException:
+        _delete_storage_object_best_effort(file_store, storage_path)
+        raise
     except Exception as e:
-        # Clean up orphaned upload on automation creation failure
-        try:
-            file_store.delete(storage_path)
-        except Exception:
-            logger.exception("Failed to clean up orphaned upload at %s", storage_path)
+        _delete_storage_object_best_effort(file_store, storage_path)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to create automation: {e!s}",
@@ -1191,8 +1349,9 @@ async def create_automation_from_plugin(
     if body.template is not None:
         creation_properties["template_id"] = body.template.id
         creation_properties["template_version"] = body.template.version
+    creation_properties.update(await automation_created_properties(session, automation))
     await capture_automation_event(
-        "automation_created",
+        automation_created_event(),
         request=request,
         user=user,
         automation=automation,

@@ -92,6 +92,7 @@ from openhands.automation.kv_schemas import (
     KVSetResponse,
 )
 from openhands.automation.models import Automation, AutomationKV, AutomationKVMeta
+from openhands.automation.router import _assert_can_manage
 from openhands.automation.utils.kv import KVTokenClaims, KVTokenError, verify_kv_token
 
 
@@ -120,8 +121,8 @@ class KVAuthContext:
 
     2. User authentication (API key / X-Session-API-Key / cookie) — used by
        humans and spawned conversations acting on a user's behalf.  Requires
-       an ``automation_id`` query parameter; the user must be a member of the
-       automation's org.
+       an ``automation_id`` query parameter; ``_verify_automation_access``
+       decides what the user may do with that automation's data.
     """
 
     automation_id: uuid.UUID
@@ -162,32 +163,55 @@ async def _try_kv_token_auth(
         )
 
 
+def _automation_not_found() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="Automation not found",
+    )
+
+
+async def _require_automation_exists(
+    session: AsyncSession,
+    automation_id: uuid.UUID,
+) -> None:
+    """Raise 404 unless an automation row (soft-deleted or not) has this id."""
+    result = await session.execute(
+        select(Automation.id).where(Automation.id == automation_id)
+    )
+    if result.first() is None:
+        raise _automation_not_found()
+
+
 async def _verify_automation_access(
     session: AsyncSession,
     user: AuthenticatedUser,
     automation_id: uuid.UUID,
+    *,
+    write: bool,
 ) -> None:
-    """Verify that the user has access to the given automation's KV data.
+    """Verify that the user may read, or also write, the automation's KV data.
 
-    The user must be a member of the automation's org (view_automations).
-    Unlike management endpoints, we do not require manage_automations for KV
-    reads — a member who can see the automation can inspect its state.
+    Every request needs ``view_automations`` and an automation in the user's
+    org: a member who can see the automation can inspect its state.  A write
+    must also pass ``_assert_can_manage``, the rule for modifying the
+    automation itself.  A run needs neither: it uses its KV token.
     """
+    if "view_automations" not in user.permissions:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Requires view_automations permission",
+        )
     result = await session.execute(
         select(Automation).where(Automation.id == automation_id)
     )
     automation = result.scalars().first()
     if automation is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Automation not found",
-        )
+        raise _automation_not_found()
     if automation.org_id != user.org_id:
         # Don't leak existence — return 404 rather than 403
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Automation not found",
-        )
+        raise _automation_not_found()
+    if write:
+        await _assert_can_manage(automation, user)
 
 
 async def _try_resolve_user(
@@ -218,6 +242,7 @@ async def _try_resolve_user(
 
 
 async def get_kv_auth_context(
+    request: Request,
     authorization: Annotated[str | None, Header()] = None,
     user: Annotated[AuthenticatedUser | None, Depends(_try_resolve_user)] = None,
     automation_id: Annotated[
@@ -241,8 +266,8 @@ async def get_kv_auth_context(
 
     2. **User auth** (humans / spawned conversations): Standard OpenHands
        authentication (API key, X-Session-API-Key, or cookie).  Requires an
-       ``automation_id`` query parameter; the user must be in the automation's
-       org.
+       ``automation_id`` query parameter; reads need ``view_automations``,
+       and writes also the right to modify that automation.
 
     The KV JWT path is checked first so existing automation scripts continue
     to work without changes.  If the Bearer token is not a JWT (or is absent),
@@ -260,6 +285,14 @@ async def get_kv_auth_context(
     if authorization:
         claims = await _try_kv_token_auth(authorization, kv_config.kv_secret)
         if claims is not None:
+            # The signature proves the service issued the token, not that its
+            # automation still exists (it may have been hard-deleted, or the
+            # claim may name an id that never existed). Answer the same 404 as
+            # user auth for an unknown automation_id instead of letting reads
+            # come back empty and the first write fail the foreign key (500).
+            # Soft-deleted automations keep their row, so their KV stays
+            # reachable here exactly as it does through user auth.
+            await _require_automation_exists(session, claims.automation_id)
             return KVAuthContext(
                 automation_id=claims.automation_id,
                 auth_method="kv_token",
@@ -281,7 +314,10 @@ async def get_kv_auth_context(
             ),
         )
 
-    await _verify_automation_access(session, user, automation_id)
+    # Every KV route that changes data uses a method other than GET.
+    await _verify_automation_access(
+        session, user, automation_id, write=request.method != "GET"
+    )
 
     return KVAuthContext(
         automation_id=automation_id,
@@ -761,6 +797,12 @@ async def get_value(
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="invalid_path",
+            )
+        except ValueError as e:
+            # Malformed path syntax (e.g. an unclosed bracket): same 400 as PATCH.
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"invalid_path: {e}",
             )
         return KVKeyPathResponse(key=key, path=path, value=value)
 

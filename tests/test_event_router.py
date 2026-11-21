@@ -3,6 +3,8 @@
 import hashlib
 import hmac
 import json
+import logging
+import time
 import uuid
 
 import jmespath
@@ -79,6 +81,69 @@ def github_pr_payload() -> dict:
                 "base": {"ref": "main", "sha": "def456"},
                 "user": {"id": 1, "login": "testuser"},
             },
+            "repository": {
+                "id": 123,
+                "name": "test-repo",
+                "full_name": "org/test-repo",
+                "private": False,
+            },
+            "sender": {"id": 1, "login": "testuser"},
+        },
+    }
+
+
+@pytest.fixture
+def github_workflow_run_payload() -> dict:
+    """Sample GitHub workflow_run.completed event payload for a failed run."""
+    return {
+        "event_type": "workflow_run",
+        "payload": {
+            "action": "completed",
+            "workflow": {
+                "id": 2823525,
+                "name": "CI",
+                "path": ".github/workflows/ci.yml",
+            },
+            "workflow_run": {
+                "id": 289782451,
+                "name": "CI",
+                "path": ".github/workflows/ci.yml",
+                "head_branch": "feature/test",
+                "head_sha": "abc123",
+                "event": "pull_request",
+                "status": "completed",
+                "conclusion": "failure",
+                "run_number": 163,
+                "run_attempt": 1,
+                "workflow_id": 2823525,
+                "html_url": "https://github.com/org/test-repo/actions/runs/289782451",
+                "pull_requests": [],
+            },
+            "repository": {
+                "id": 123,
+                "name": "test-repo",
+                "full_name": "org/test-repo",
+                "private": False,
+            },
+            "sender": {"id": 1, "login": "testuser"},
+        },
+    }
+
+
+@pytest.fixture
+def github_status_payload() -> dict:
+    """Sample GitHub status event payload for a failed commit status."""
+    return {
+        "event_type": "status",
+        "payload": {
+            "id": 9216538,
+            "sha": "abc123",
+            "name": "org/test-repo",
+            "state": "failure",
+            "context": "ci/build",
+            "description": "Build failed",
+            "target_url": "https://ci.example.com/builds/7",
+            "branches": [{"name": "feature/test"}],
             "repository": {
                 "id": 123,
                 "name": "test-repo",
@@ -200,6 +265,10 @@ async def test_requested_github_event_types_returns_supported_event_families(
         "issue_comment",
         "push",
         "release",
+        "workflow_run",
+        "check_suite",
+        "check_run",
+        "status",
     ]
     assert data["event_detection_rules"][0] == {
         "event_type": "pull_request_review",
@@ -260,6 +329,49 @@ async def test_requested_bitbucket_data_center_event_types_detect_each_key(
     assert detected == ["pr:opened"]
     assert not any(
         jmespath.search(rule["jmespath"], {"eventKey": "diagnostics:ping"})
+        for rule in data["event_detection_rules"]
+    )
+    assert data["org_ids"] is None
+
+
+@pytest.mark.asyncio
+async def test_requested_azure_devops_event_types_are_the_installed_hooks(
+    async_client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The catalog names the Service Hooks the OpenHands server installs."""
+    monkeypatch.setenv("AUTOMATION_WEBHOOK_SECRET", "test-secret")
+    source = "azure_devops"
+
+    response = await async_client.get(
+        f"/api/automation/v1/events/{source}/requested-types",
+        headers={"X-Hub-Signature-256": sign_text(source, "test-secret")},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["event_types"] == [
+        "git.pullrequest.created",
+        "git.pullrequest.merged",
+        "git.pullrequest.updated",
+        "ms.vss-code.git-pullrequest-comment-event",
+        "workitem.commented",
+    ]
+    assert [rule["event_type"] for rule in data["event_detection_rules"]] == (
+        data["event_types"]
+    )
+    pull_request_created = {
+        "eventType": "git.pullrequest.created",
+        "resource": {"pullRequestId": 42},
+    }
+    detected = [
+        rule["event_type"]
+        for rule in data["event_detection_rules"]
+        if jmespath.search(rule["jmespath"], pull_request_created)
+    ]
+    assert detected == ["git.pullrequest.created"]
+    assert not any(
+        jmespath.search(rule["jmespath"], {"eventType": "git.push"})
         for rule in data["event_detection_rules"]
     )
     assert data["org_ids"] is None
@@ -392,6 +504,97 @@ async def test_receive_github_event_with_matching_automation(
     assert response.status_code == 200
     data = response.json()
     assert data["received"] is True
+    assert data["matched"] == 1
+    assert len(data["runs_created"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_receive_github_workflow_run_failure_creates_run(
+    async_client: AsyncClient,
+    org_id: uuid.UUID,
+    github_workflow_run_payload: dict,
+    async_session,
+    monkeypatch: pytest.MonkeyPatch,
+    mock_authenticated_user,
+):
+    """A forwarded workflow_run.completed event reaches a CI-remediation automation."""
+    monkeypatch.setenv("AUTOMATION_WEBHOOK_SECRET", "test-secret")
+
+    automation = Automation(
+        id=uuid.uuid4(),
+        user_id=mock_authenticated_user.user_id,
+        org_id=org_id,
+        name="Fix failing CI",
+        tarball_path="oh-internal://uploads/test.tar.gz",
+        entrypoint="python main.py",
+        trigger={
+            "type": "event",
+            "source": "github",
+            "on": "workflow_run.completed",
+            "filter": "workflow_run.conclusion == 'failure'",
+        },
+    )
+    async_session.add(automation)
+    await async_session.commit()
+
+    signature, body = sign_payload(github_workflow_run_payload, "test-secret")
+
+    response = await async_client.post(
+        f"/api/automation/v1/events/{org_id}/github",
+        content=body,
+        headers={
+            "X-Hub-Signature-256": signature,
+            "Content-Type": "application/json",
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["received"] is True
+    assert data["matched"] == 1
+    assert len(data["runs_created"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_receive_github_status_failure_creates_run(
+    async_client: AsyncClient,
+    org_id: uuid.UUID,
+    github_status_payload: dict,
+    async_session,
+    monkeypatch: pytest.MonkeyPatch,
+    mock_authenticated_user,
+):
+    """A forwarded failed commit status reaches a CI-gate automation."""
+    monkeypatch.setenv("AUTOMATION_WEBHOOK_SECRET", "test-secret")
+    automation = Automation(
+        id=uuid.uuid4(),
+        user_id=mock_authenticated_user.user_id,
+        org_id=org_id,
+        name="Send failed CI back to development",
+        tarball_path="oh-internal://uploads/test.tar.gz",
+        entrypoint="python main.py",
+        trigger={
+            "type": "event",
+            "source": "github",
+            "on": "status",
+            "filter": "state == 'failure'",
+        },
+    )
+    async_session.add(automation)
+    await async_session.commit()
+    signature, body = sign_payload(github_status_payload, "test-secret")
+
+    response = await async_client.post(
+        f"/api/automation/v1/events/{org_id}/github",
+        content=body,
+        headers={
+            "X-Hub-Signature-256": signature,
+            "Content-Type": "application/json",
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
     assert data["matched"] == 1
     assert len(data["runs_created"]) == 1
 
@@ -904,6 +1107,139 @@ async def test_github_event_without_a_delivery_header_is_still_recorded(
     assert {event.matched_count for event in events} == {0}
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source", "payload_fixture", "on", "delivery_id"),
+    [
+        (
+            "bitbucket_data_center",
+            "bitbucket_data_center_pr_payload",
+            "pr:opened",
+            # Bitbucket DC's X-Request-Id, forwarded by the OpenHands server.
+            "@1AB2CD3x4EF5GH6x7IJ8KL9x0",
+        ),
+        (
+            "jira_dc",
+            "jira_dc_comment_payload",
+            "comment_created",
+            # The body signature the OpenHands server already dedupes on.
+            "9c1f2e8d7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a1f0e",
+        ),
+    ],
+)
+async def test_redelivered_data_center_event_creates_runs_once(
+    async_client: AsyncClient,
+    org_id: uuid.UUID,
+    async_session,
+    monkeypatch: pytest.MonkeyPatch,
+    mock_authenticated_user,
+    request: pytest.FixtureRequest,
+    source: str,
+    payload_fixture: str,
+    on: str,
+    delivery_id: str,
+):
+    """Both Data Center sources dedupe on the delivery id in the shared header.
+
+    A repeat with the same id is acknowledged 2XX but routed to nothing; the
+    same body under a new id is a new delivery and routes again.
+    """
+    monkeypatch.setenv("AUTOMATION_WEBHOOK_SECRET", "test-secret")
+    payload = request.getfixturevalue(payload_fixture)
+
+    async_session.add(
+        Automation(
+            id=uuid.uuid4(),
+            user_id=mock_authenticated_user.user_id,
+            org_id=org_id,
+            name=f"On {source} {on}",
+            tarball_path="oh-internal://uploads/test.tar.gz",
+            entrypoint="python main.py",
+            trigger={"type": "event", "source": source, "on": on},
+        )
+    )
+    await async_session.commit()
+
+    signature, body = sign_payload(payload, "test-secret")
+    headers = {
+        "X-Hub-Signature-256": signature,
+        "X-GitHub-Delivery": delivery_id,
+        "Content-Type": "application/json",
+    }
+    url = f"/api/automation/v1/events/{org_id}/{source}"
+
+    first = await async_client.post(url, content=body, headers=headers)
+    second = await async_client.post(url, content=body, headers=headers)
+
+    assert first.status_code == 200
+    assert first.json()["matched"] == 1
+    assert len(first.json()["runs_created"]) == 1
+
+    assert second.status_code == 200
+    assert second.json()["matched"] == 0
+    assert second.json()["runs_created"] == []
+
+    runs = (await async_session.execute(select(AutomationRun))).scalars().all()
+    assert len(runs) == 1
+    events = (await async_session.execute(select(IntegrationEvent))).scalars().all()
+    assert [event.provider_event_id for event in events] == [delivery_id]
+
+    third = await async_client.post(
+        url, content=body, headers={**headers, "X-GitHub-Delivery": f"{delivery_id}-2"}
+    )
+    assert third.status_code == 200
+    assert third.json()["matched"] == 1
+    runs = (await async_session.execute(select(AutomationRun))).scalars().all()
+    assert len(runs) == 2
+
+
+@pytest.mark.asyncio
+async def test_jira_dc_delivery_fanned_out_to_two_orgs_runs_in_each(
+    async_client: AsyncClient,
+    org_id: uuid.UUID,
+    jira_dc_comment_payload: dict,
+    async_session,
+    monkeypatch: pytest.MonkeyPatch,
+    mock_authenticated_user,
+):
+    """The OpenHands server forwards one Jira DC delivery to every org with a
+    Jira DC automation under the same id; dedupe is per org, so each runs."""
+    monkeypatch.setenv("AUTOMATION_WEBHOOK_SECRET", "test-secret")
+    other_org = uuid.uuid4()
+    for target in (org_id, other_org):
+        async_session.add(
+            Automation(
+                id=uuid.uuid4(),
+                user_id=mock_authenticated_user.user_id,
+                org_id=target,
+                name="On Jira DC comments",
+                tarball_path="oh-internal://uploads/test.tar.gz",
+                entrypoint="python main.py",
+                trigger={"type": "event", "source": "jira_dc", "on": "comment_created"},
+            )
+        )
+    await async_session.commit()
+
+    signature, body = sign_payload(jira_dc_comment_payload, "test-secret")
+    headers = {
+        "X-Hub-Signature-256": signature,
+        "X-GitHub-Delivery": "same-delivery",
+        "Content-Type": "application/json",
+    }
+    for target in (org_id, other_org):
+        response = await async_client.post(
+            f"/api/automation/v1/events/{target}/jira_dc", content=body, headers=headers
+        )
+        assert response.status_code == 200
+        assert response.json()["matched"] == 1
+
+    runs = (await async_session.execute(select(AutomationRun))).scalars().all()
+    assert len(runs) == 2
+    events = (await async_session.execute(select(IntegrationEvent))).scalars().all()
+    assert {event.org_id for event in events} == {org_id, other_org}
+    assert {event.provider_event_id for event in events} == {"same-delivery"}
+
+
 async def _add_custom_webhook(
     async_session,
     org_id: uuid.UUID,
@@ -976,3 +1312,246 @@ async def test_redelivered_custom_event_creates_runs_once(
     events = (await async_session.execute(select(IntegrationEvent))).scalars().all()
     assert len(events) == 1
     assert events[0].provider_event_id == "72d3162e-cc78-11e3-81ab-4c9367dc0958"
+
+
+def _slack_headers(body: bytes, secret: str = "s3cret-value") -> dict[str, str]:
+    """Sign a body the way Slack's Events API does."""
+    now = str(int(time.time()))
+    signed = b"v0:" + now.encode() + b":" + body
+    digest = hmac.new(secret.encode(), signed, hashlib.sha256).hexdigest()
+    return {
+        "X-Slack-Signature": f"v0={digest}",
+        "X-Slack-Request-Timestamp": now,
+        "Content-Type": "application/json",
+    }
+
+
+async def _add_slack_webhook(async_session, org_id: uuid.UUID, source: str) -> None:
+    """A Slack Events API webhook: v0 signing and a body-derived delivery id."""
+    async_session.add(
+        CustomWebhook(
+            org_id=org_id,
+            name=source,
+            source=source,
+            webhook_secret="s3cret-value",
+            event_key_expr="event.type",
+            signature_header="X-Slack-Signature",
+            signature_scheme="slack_v0",
+            # Slack's delivery id. event.ts is not one: a mention's message and
+            # app_mention events share it. A URL verification carries neither.
+            event_id_expr="event_id",
+        )
+    )
+    await async_session.commit()
+
+
+def _slack_event(event_id: str, event_type: str) -> dict:
+    """An Events API delivery, as Slack wraps every event."""
+    return {
+        "type": "event_callback",
+        "team_id": "T123ABC456",
+        "event_id": event_id,
+        "event": {
+            "type": event_type,
+            "channel": "C123ABC456",
+            "ts": "1725864000.000100",
+            "text": "<@U0LAN0Z89> hello",
+        },
+    }
+
+
+async def _post_slack(async_client: AsyncClient, org_id: uuid.UUID, payload):
+    body = json.dumps(payload).encode()
+    return await async_client.post(
+        f"/api/automation/v1/events/{org_id}/slack",
+        content=body,
+        headers=_slack_headers(body),
+    )
+
+
+@pytest.mark.asyncio
+async def test_slack_url_verification_challenge_is_echoed(
+    async_client: AsyncClient,
+    org_id: uuid.UUID,
+    async_session,
+    mock_authenticated_user,
+    caplog: pytest.LogCaptureFixture,
+):
+    """A signed URL verification is answered with its challenge, verbatim.
+
+    Slack's first delivery to a new webhook URL must be answered with the raw
+    challenge string, before any event parsing or body-ID extraction (the
+    verification payload has no event_id).
+    """
+    await _add_slack_webhook(async_session, org_id, "slack")
+    caplog.set_level(logging.INFO, logger="automation.event_router")
+
+    response = await _post_slack(
+        async_client,
+        org_id,
+        {"type": "url_verification", "challenge": "3eZbrw1a6mfsZjFAdZuk"},
+    )
+
+    assert response.status_code == 200
+    assert response.text == "3eZbrw1a6mfsZjFAdZuk"
+    assert response.headers["content-type"].startswith("text/plain")
+    assert "Answered URL verification for source=slack" in caplog.text
+
+    events = (await async_session.execute(select(IntegrationEvent))).scalars().all()
+    assert events == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"type": "url_verification"},
+        {"type": "url_verification", "challenge": ""},
+        {"type": "url_verification", "challenge": 123},
+    ],
+    ids=["missing", "empty", "not-a-string"],
+)
+async def test_slack_url_verification_rejects_an_invalid_challenge(
+    async_client: AsyncClient,
+    org_id: uuid.UUID,
+    async_session,
+    payload: dict,
+):
+    """A verification without a usable challenge is a bad request, not a run."""
+    await _add_slack_webhook(async_session, org_id, "slack")
+
+    response = await _post_slack(async_client, org_id, payload)
+
+    assert response.status_code == 400
+    events = (await async_session.execute(select(IntegrationEvent))).scalars().all()
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_slack_url_verification_requires_a_valid_signature(
+    async_client: AsyncClient,
+    org_id: uuid.UUID,
+    async_session,
+):
+    """The challenge is echoed only to a delivery Slack signed."""
+    await _add_slack_webhook(async_session, org_id, "slack")
+
+    body = json.dumps(
+        {"type": "url_verification", "challenge": "3eZbrw1a6mfsZjFAdZuk"}
+    ).encode()
+    headers = _slack_headers(body)
+    headers["X-Slack-Signature"] = "v0=" + "0" * 64
+    response = await async_client.post(
+        f"/api/automation/v1/events/{org_id}/slack",
+        content=body,
+        headers=headers,
+    )
+
+    assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_slack_url_verification_is_only_read_from_an_object(
+    async_client: AsyncClient,
+    org_id: uuid.UUID,
+    async_session,
+):
+    """A signed non-object body is not a handshake and does not crash it."""
+    await _add_slack_webhook(async_session, org_id, "slack")
+
+    response = await _post_slack(
+        async_client, org_id, [{"type": "url_verification", "challenge": "c"}]
+    )
+
+    assert response.status_code != 500
+    assert response.text != "c"
+
+
+@pytest.mark.asyncio
+async def test_url_verification_is_an_ordinary_event_for_other_schemes(
+    async_client: AsyncClient,
+    org_id: uuid.UUID,
+    async_session,
+    mock_authenticated_user,
+):
+    """Only slack_v0 answers the handshake; other schemes route the payload."""
+    async_session.add(
+        CustomWebhook(
+            org_id=org_id,
+            name="hooks",
+            source="hooks",
+            webhook_secret="s3cret-value",
+            event_key_expr="type",
+            signature_header="X-Signature-256",
+        )
+    )
+    async_session.add(
+        Automation(
+            id=uuid.uuid4(),
+            user_id=mock_authenticated_user.user_id,
+            org_id=org_id,
+            name="On url_verification",
+            tarball_path="oh-internal://uploads/test.tar.gz",
+            entrypoint="python main.py",
+            trigger={"type": "event", "source": "hooks", "on": "url_verification"},
+        )
+    )
+    await async_session.commit()
+
+    body = json.dumps({"type": "url_verification", "challenge": "c"}).encode()
+    digest = hmac.new(b"s3cret-value", body, hashlib.sha256).hexdigest()
+    response = await async_client.post(
+        f"/api/automation/v1/events/{org_id}/hooks",
+        content=body,
+        headers={
+            "X-Signature-256": f"sha256={digest}",
+            "Content-Type": "application/json",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["matched"] == 1
+
+
+@pytest.mark.asyncio
+async def test_slack_events_still_route_after_verification(
+    async_client: AsyncClient,
+    org_id: uuid.UUID,
+    async_session,
+    mock_authenticated_user,
+):
+    """After the handshake, signed events on the webhook parse, dedupe and route.
+
+    A mention arrives twice when the app subscribes to messages too: as a
+    message event and as an app_mention, with the same ts but distinct
+    event_ids. Only a retry of the same event_id is a duplicate.
+    """
+    await _add_slack_webhook(async_session, org_id, "slack")
+    async_session.add(
+        Automation(
+            id=uuid.uuid4(),
+            user_id=mock_authenticated_user.user_id,
+            org_id=org_id,
+            name="On slack mentions",
+            tarball_path="oh-internal://uploads/test.tar.gz",
+            entrypoint="python main.py",
+            trigger={"type": "event", "source": "slack", "on": "app_mention"},
+        )
+    )
+    await async_session.commit()
+
+    verification = await _post_slack(
+        async_client, org_id, {"type": "url_verification", "challenge": "c"}
+    )
+    message = await _post_slack(async_client, org_id, _slack_event("Ev1", "message"))
+    mention = await _post_slack(
+        async_client, org_id, _slack_event("Ev2", "app_mention")
+    )
+    retry = await _post_slack(async_client, org_id, _slack_event("Ev2", "app_mention"))
+
+    assert verification.text == "c"
+    assert message.json()["matched"] == 0
+    assert mention.json()["matched"] == 1
+    assert retry.json()["matched"] == 0
+    events = (await async_session.execute(select(IntegrationEvent))).scalars().all()
+    assert sorted(event.provider_event_id for event in events) == ["Ev1", "Ev2"]

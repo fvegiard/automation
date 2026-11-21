@@ -51,6 +51,19 @@ class DailySandboxLimitReachedError(Exception):
     pass
 
 
+class LicenseLimitReachedError(Exception):
+    """The install's license does not let this run start.
+
+    An OpenHands Enterprise install without a valid license limits who can
+    start conversations and how many, and refuses the run's sandbox. This is
+    not a fault in the automation, and runs work again once the install has a
+    license, so the run is marked SKIPPED (not FAILED) and the automation is
+    left enabled.
+    """
+
+    pass
+
+
 class SandboxProvisioningError(Exception):
     """A sandbox never became ready, so no automation code ran in it.
 
@@ -85,3 +98,37 @@ class SandboxProvisioningError(Exception):
         if self.timed_out:
             return "sandbox_ready_timeout"
         return f"sandbox_{self.status.lower()}"
+
+
+class ConversationStartUnavailable(Exception):
+    """The OpenHands API cannot start a conversation in a run's sandbox.
+
+    An older app server has no such route or rejects the request body. The run
+    keeps the previous behavior: the runner creates its own conversation.
+    """
+
+    def __init__(self, message: str, *, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class ConversationStartError(Exception):
+    """The OpenHands API did not start the run's conversation as requested.
+
+    ``transient`` marks failures a later run may not meet (a start task that
+    never finished). A refusal, a failed start task or a launch from a profile
+    other than the requested one is final for this run.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        transient: bool = False,
+        code: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.transient = transient
+        self.code = code

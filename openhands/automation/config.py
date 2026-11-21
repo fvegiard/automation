@@ -222,6 +222,13 @@ class SandboxSettings(BaseSettings):
         AUTOMATION_RATE_LIMIT_MIN_WAIT: Initial 429 wait (default: 10)
         AUTOMATION_RATE_LIMIT_MAX_WAIT: Max retry wait (default: 60)
         AUTOMATION_RATE_LIMIT_MAX_RETRIES: Max retries (default: 5)
+        AUTOMATION_SANDBOX_INTERNAL_URL: URL this service uses to reach
+            sandboxes. The OpenHands API returns sandbox URLs with the public
+            address that browsers use. When set, this URL replaces their
+            origin (scheme://host[:port]) and keeps the path and query. Set it
+            when the public address resolves differently inside the network
+            or a firewall blocks it. Empty uses the URLs unchanged
+            (default: "")
     """
 
     default_run_duration: int = 10 * 60  # 10 minutes
@@ -243,6 +250,7 @@ class SandboxSettings(BaseSettings):
     rate_limit_min_wait: int = 10
     rate_limit_max_wait: int = 60
     rate_limit_max_retries: int = 5
+    sandbox_internal_url: str = ""
 
     model_config = {"env_prefix": "AUTOMATION_"}
 
@@ -375,6 +383,8 @@ class GitSyncSettings(BaseSettings):
         AUTOMATION_GIT_SYNC_TOKEN: PAT (or other bearer token) for HTTPS
             authentication against the repo. Passed per git-invocation via
             `-c http.extraHeader`, never written to disk or the remote URL.
+            Sent as Basic auth (`x-access-token`), or as a Bearer header for
+            remotes such as Bitbucket Data Center that reject that username.
         AUTOMATION_GIT_SYNC_ENCRYPTION_KEY: When set, encrypts file contents
             (via the SDK's Fernet-based Cipher, same primitive as the KV
             store) before they're written to the synced repo. Empty disables
@@ -386,7 +396,9 @@ class GitSyncSettings(BaseSettings):
         AUTOMATION_GIT_SYNC_LOCAL_WORKDIR: Local working directory for the
             clone. Defaults to "{workspace_base}/git-sync" when empty.
         AUTOMATION_GIT_SYNC_GIT_TIMEOUT_SECONDS: Timeout for individual git
-            subprocess invocations (default: 60).
+            subprocess invocations (default: 300). A first clone of a
+            normal-sized repo over a slow link can take minutes. Each org can
+            override it from the Git Sync config (`git_timeout_seconds`).
         AUTOMATION_GIT_SYNC_SECRET: Key that wraps the per-org git token and
             encryption key at rest (see `git_sync/secret_store.py`). Falls
             back to AUTOMATION_KV_SECRET, then (local mode only) to a key
@@ -415,7 +427,7 @@ class GitSyncSettings(BaseSettings):
     git_sync_author_name: str = "OpenHands Automation"
     git_sync_author_email: str = "automation@openhands.dev"
     git_sync_local_workdir: str = ""
-    git_sync_git_timeout_seconds: float = 60.0
+    git_sync_git_timeout_seconds: float = 300.0
     git_sync_secret: str = ""
 
     # After this many consecutive auth failures, the loop stops logging a full
@@ -543,6 +555,15 @@ class ServiceSettings(BaseSettings):
         AUTOMATION_DISPATCHER_INTERVAL_SECONDS: Dispatcher poll interval (default: 10)
         AUTOMATION_DISPATCHER_BATCH_SIZE: Dispatcher batch size (default: 10)
         AUTOMATION_WATCHDOG_INTERVAL_SECONDS: Watchdog poll interval (default: 60)
+        AUTOMATION_MAX_CONCURRENT_RUNS: Cap on concurrently RUNNING runs across
+            the service (default: 0 = unlimited). At the cap, further PENDING
+            runs wait in the queue until a slot frees.
+        AUTOMATION_DEFER_MAX_AGE_SECONDS: Longest a run blocked by the
+            concurrency limit stays deferred before it is SKIPPED (default:
+            21600; 0 disables deferral and restores immediate skip). Runs
+            blocked by the daily sandbox limit are always skipped at once.
+        AUTOMATION_DEFER_BACKOFF_BASE_SECONDS: Base delay of the bounded
+            exponential backoff between deferrals (default: 60)
         AUTOMATION_FAILURE_DISABLE_THRESHOLD: Consecutive permanent failures before
             auto-disabling an automation (default: 3, <=0 disables auto-disable)
         AUTOMATION_CONSECUTIVE_FAILURE_DISABLE_THRESHOLD: Consecutive failures
@@ -577,12 +598,17 @@ class ServiceSettings(BaseSettings):
 
         # Auth
         AUTOMATION_SERVICE_KEY: Service key for SaaS API (required in cloud mode)
+        AUTOMATION_FACTORY_TOKEN_TTL_SECONDS: Lifetime of the factory run token
+            (default: 86400, the shared contract's 24 hours). Keep it above the
+            longest possible run, or the token expires mid-run.
         AUTOMATION_WEBHOOK_SECRET: Webhook signature secret (optional)
         AUTOMATION_OPENHANDS_API_BASE_URL: OpenHands API URL (default: https://app.all-hands.dev)
 
         # Product telemetry (optional)
         AUTOMATION_POSTHOG_API_KEY: PostHog project key. Empty disables capture.
         AUTOMATION_POSTHOG_HOST: PostHog capture host (default: https://us.i.posthog.com)
+        AUTOMATION_TELEMETRY_DEPLOYMENT_MODE: Label events local, cloud, or self_hosted
+            (default: local in local mode, otherwise cloud)
     """
 
     # Database (PostgreSQL - Cloud mode)
@@ -649,6 +675,25 @@ class ServiceSettings(BaseSettings):
     dispatcher_batch_size: int = 10
     watchdog_interval_seconds: int = 60
 
+    # Maximum number of automation runs allowed to be RUNNING at once across the
+    # whole service. 0 (the default) disables the gate: every claimed run is
+    # launched, preserving today's behavior. When set, the dispatcher admits at
+    # most this many runs per poll and leaves the rest PENDING (the table is the
+    # queue) until a slot frees. The gate bounds total in-flight sandboxes.
+    max_concurrent_runs: int = Field(default=0, ge=0)
+
+    # A run blocked by the organization concurrency cap is returned to PENDING
+    # with deferred_until instead of being marked terminal SKIPPED. This is the
+    # longest a run may stay deferred; past it the run is SKIPPED with a
+    # `defer_expired` status detail. 0 disables deferral and restores the
+    # immediate-skip behavior.
+    defer_max_age_seconds: int = Field(default=21600, ge=0)  # 6 hours
+
+    # Base delay of the bounded exponential backoff between deferrals. The nth
+    # consecutive deferral waits defer_backoff_base_seconds * 2**(n-1), +/-50%
+    # jitter, capped at defer_max_age_seconds.
+    defer_backoff_base_seconds: int = Field(default=60, ge=0)
+
     # Auto-disable rules. `failure_disable_threshold` is the fast path for
     # unambiguous config faults (bad key, revoked token) and needs no time
     # guard. The two rules below catch automations that merely fail forever;
@@ -672,6 +717,12 @@ class ServiceSettings(BaseSettings):
     # conversation stays resumable in the UI meanwhile.
     sandbox_cleanup_delay_seconds: int = Field(default=0, ge=0)
 
+    # Cloud mode: how long a completed run's sandbox keeps running before it is
+    # deleted or paused. The agent server posts a partial batch of conversation
+    # events to the app server only after WebhookSpec.flush_delay (30 s) without
+    # a new event, so earlier teardown loses the conversation's last events.
+    sandbox_event_flush_grace_seconds: int = Field(default=35, ge=0)
+
     # How long an accepted event stays in `integration_events`. It bounds two
     # things: the dedupe window (a redelivery older than this is indistinguishable
     # from a new event) and the table, which otherwise grows with every delivery.
@@ -686,6 +737,10 @@ class ServiceSettings(BaseSettings):
     # API keys (called by the dispatcher before each automation run).
     # Required in cloud mode, not needed in local mode.
     service_key: str = ""
+
+    # Lifetime of AUTOMATION_FACTORY_TOKEN. Enterprise checks only `exp`, so
+    # this can change without a contract change.
+    factory_token_ttl_seconds: int = Field(default=24 * 60 * 60, gt=0)
 
     # Public base URL where this service is reachable (without /api/automation).
     # Example: https://app.all-hands.dev or https://domain/acmecorp
@@ -711,6 +766,9 @@ class ServiceSettings(BaseSettings):
     # project key is configured by the deployment.
     posthog_api_key: str = ""
     posthog_host: str = "https://us.i.posthog.com"
+    # Overrides the deployment_mode / deployment_kind event labels. A self-hosted
+    # (OHE) deployment runs in cloud mode but is not remote.
+    telemetry_deployment_mode: Literal["local", "cloud", "self_hosted"] | None = None
 
     model_config = {"env_prefix": "AUTOMATION_"}
 

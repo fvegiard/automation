@@ -9,7 +9,7 @@ from typing import Any
 
 import httpx
 from fastapi import Request
-from sqlalchemy import text
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from openhands.automation import __version__
@@ -267,6 +267,59 @@ def _resolve_distinct_id(
     )
 
 
+def _failure_kind_from_error_detail(error_detail: str | None) -> str | None:
+    """Coarse, non-identifying failure category derived from stored prefixes.
+
+    ``error_detail`` itself is free text and must never reach telemetry; only
+    the closed set of prefixes this service writes is mapped.
+    """
+    if not error_detail:
+        return None
+    if error_detail.startswith("Timed out: verification failed"):
+        return "verification_failed"
+    if error_detail.startswith("Timed out:"):
+        return "timeout"
+    if error_detail.startswith("Cancelled"):
+        return "cancelled"
+    if error_detail.startswith("Failed to get execution context"):
+        return "dispatch_error"
+    return "execution_error"
+
+
+# Failure events must stay categorizable even when a caller stored no error
+# text, so terminal failure captures fall back to these bounded values.
+# Stage names reuse the vocabulary record_first_run_outcome already records.
+_FAILURE_STAGE_BY_TRIGGER_SOURCE = {
+    "callback": "execution",
+    "dispatcher": "dispatch",
+    "watchdog": "watchdog",
+}
+_FAILURE_EVENTS = frozenset({"automation_run_failed", "automation_run_dispatch_failed"})
+
+
+def _ensure_failure_properties(event: str, properties: dict[str, Any]) -> None:
+    """Guarantee bounded failure_stage/failure_kind on failure events.
+
+    Explicit caller properties always win; raw error text is never copied.
+    """
+    if event not in _FAILURE_EVENTS:
+        return
+    stage = properties.get("failure_stage")
+    if not stage:
+        trigger_source = properties.get("trigger_source")
+        stage = (
+            _FAILURE_STAGE_BY_TRIGGER_SOURCE.get(trigger_source)
+            if isinstance(trigger_source, str)
+            else None
+        )
+        if stage is not None:
+            properties["failure_stage"] = stage
+    if not properties.get("failure_kind"):
+        properties["failure_kind"] = (
+            "dispatch_error" if stage == "dispatch" else "execution_error"
+        )
+
+
 @lru_cache(maxsize=1)
 def _installed_sdk_version() -> str:
     # Only successful lookups are cached: lru_cache does not memoize exceptions.
@@ -290,9 +343,14 @@ def _base_properties(
     backend_distinct_id: str,
 ) -> dict[str, Any]:
     settings = get_config().service
+    # A self-hosted (OHE) deployment runs in cloud mode but is not remote; the
+    # override labels its events correctly.
+    deployment_mode = settings.telemetry_deployment_mode or (
+        "local" if settings.is_local_mode else "cloud"
+    )
     properties: dict[str, Any] = {
-        "deployment_mode": "local" if settings.is_local_mode else "cloud",
-        "deployment_kind": "local" if settings.is_local_mode else "remote",
+        "deployment_mode": deployment_mode,
+        "deployment_kind": "remote" if deployment_mode == "cloud" else "local",
         "automation_service": "openhands_automation",
         **_server_version_properties(),
     }
@@ -345,6 +403,9 @@ def _base_properties(
                 "has_conversation_id": bool(run.conversation_id),
             }
         )
+        failure_kind = _failure_kind_from_error_detail(run.error_detail)
+        if failure_kind is not None:
+            properties["failure_kind"] = failure_kind
         properties.setdefault("automation_id", str(run.automation_id))
         if run.started_at and run.completed_at:
             duration_ms = int(
@@ -355,6 +416,43 @@ def _base_properties(
             )
             properties["duration_ms"] = duration_ms
 
+    return properties
+
+
+def automation_created_event() -> str:
+    """Name of the automation-created event on this deployment.
+
+    Self-hosted Enterprise reports it as ``ohe_automation_created`` (OHE-3657);
+    every other deployment keeps ``automation_created``.
+    """
+    if get_config().service.telemetry_deployment_mode == "self_hosted":
+        return "ohe_automation_created"
+    return "automation_created"
+
+
+async def automation_created_properties(
+    session: AsyncSession, automation: Automation
+) -> dict[str, Any]:
+    """Properties every ``automation_created`` capture carries.
+
+    ``is_first_automation_in_org`` is true when no other automation row exists
+    in the organization, so the first creation marks activation (OHE-3657).
+    Never raises: a failed count leaves the flag out rather than failing the
+    request.
+    """
+    properties: dict[str, Any] = {"automation_name": automation.name}
+    try:
+        others = await session.scalar(
+            select(func.count())
+            .select_from(Automation)
+            .where(
+                Automation.org_id == automation.org_id,
+                Automation.id != automation.id,
+            )
+        )
+        properties["is_first_automation_in_org"] = (others or 0) == 0
+    except Exception:
+        logger.debug("Failed to count automations for telemetry", exc_info=True)
     return properties
 
 
@@ -442,6 +540,7 @@ async def _capture_automation_event(
     )
     if properties:
         event_properties.update(properties)
+    _ensure_failure_properties(event, event_properties)
 
     payload = {
         "api_key": settings.posthog_api_key,

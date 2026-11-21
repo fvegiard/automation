@@ -21,7 +21,9 @@ from openhands.automation.preset_router import (
     CreatePromptAutomationRequest,
 )
 from openhands.automation.schemas import (
+    FACTORY_ID_DESCRIPTION,
     RUN_AS_USER_ID_DESCRIPTION,
+    TAGS_DESCRIPTION,
     AutomationState,
     CreateAutomationRequest,
     DraftEndpoint,
@@ -29,6 +31,7 @@ from openhands.automation.schemas import (
     normalize_automation_state_enabled,
     validate_command_string,
 )
+from openhands.automation.tags import normalize_tags
 from openhands.automation.utils.timeout import validate_automation_timeout
 from openhands.sdk.plugin import PluginSource
 from openhands.workspace import RepoSource
@@ -101,7 +104,11 @@ class _BaseDraftBody(BaseModel):
     run_as_user_id: uuid.UUID | None = Field(
         default=None, description=RUN_AS_USER_ID_DESCRIPTION
     )
+    agent_profile_id: uuid.UUID | None = None
     name: str | None = Field(default=None, min_length=1, max_length=500)
+    factory_id: uuid.UUID | None = Field(
+        default=None, description=FACTORY_ID_DESCRIPTION
+    )
     description: str | None = Field(default=None, max_length=2000)
     model: str | None = Field(
         default=None,
@@ -143,9 +150,15 @@ def _normalize_list_field(data: dict[str, Any], field: str) -> None:
 class RawAutomationDraftBody(_BaseDraftBody):
     """Partial body for the raw `/v1` automation creation endpoint."""
 
+    tags: list[str] = Field(default_factory=list, description=TAGS_DESCRIPTION)
     tarball_path: str | None = None
     setup_script_path: str | None = None
     entrypoint: str | None = None
+
+    @field_validator("tags")
+    @classmethod
+    def validate_tags(cls, v: list[str]) -> list[str]:
+        return normalize_tags(v)
 
     @field_validator("tarball_path")
     @classmethod

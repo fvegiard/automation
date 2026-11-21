@@ -22,6 +22,7 @@ from openhands.automation.db import (
 from openhands.automation.dispatcher import dispatcher_loop
 from openhands.automation.draft_router import router as draft_router
 from openhands.automation.event_router import router as event_router
+from openhands.automation.factory_router import router as factory_router
 from openhands.automation.git_sync import git_sync_loop
 from openhands.automation.git_sync.router import router as git_sync_router
 from openhands.automation.kv_router import router as kv_router
@@ -34,6 +35,7 @@ from openhands.automation.observability import init_observability
 from openhands.automation.preset_router import router as preset_router
 from openhands.automation.router import router
 from openhands.automation.scheduler import scheduler_loop
+from openhands.automation.service_router import router as service_router
 from openhands.automation.streams import stream_supervisor_loop
 from openhands.automation.telemetry import (
     close_telemetry_http_client,
@@ -41,6 +43,7 @@ from openhands.automation.telemetry import (
 )
 from openhands.automation.telemetry_router import router as telemetry_router
 from openhands.automation.uploads import router as uploads_router
+from openhands.automation.usage_router import router as usage_router
 from openhands.automation.utils.version import get_sdk_version, get_server_version_info
 from openhands.automation.watchdog import watchdog_loop
 from openhands.automation.webhook_router import router as webhook_router
@@ -275,7 +278,7 @@ def _create_app() -> FastAPI:
         description=(
             "Scheduled and event-driven automation execution for OpenHands Cloud"
         ),
-        version="1.26.1",  # x-release-please-version
+        version="1.34.1",  # x-release-please-version
         lifespan=lifespan,
         docs_url=f"{base_path}/docs",
         openapi_url=f"{base_path}/openapi.json",
@@ -307,7 +310,10 @@ app.include_router(preset_router, prefix=_base_path)
 app.include_router(draft_router, prefix=_base_path)
 app.include_router(event_router, prefix=_base_path)
 app.include_router(webhook_router, prefix=_base_path)
+app.include_router(factory_router, prefix=_base_path)
+app.include_router(service_router, prefix=_base_path)
 app.include_router(telemetry_router, prefix=_base_path)
+app.include_router(usage_router, prefix=_base_path)
 app.include_router(git_sync_router, prefix=_base_path)
 
 app.include_router(kv_router, prefix=_base_path)

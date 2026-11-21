@@ -53,7 +53,10 @@ automation/
 │       ├── conversations.py    # Routes an event to its subject's conversation
 │       ├── db.py               # Database engine and session factory (asyncpg / Cloud SQL)
 │       ├── dispatcher.py       # Polls PENDING runs, dispatches to sandbox (fire-and-forget)
+│       ├── draft_router.py     # Saved setup draft CRUD and test dispatch routes
+│       ├── draft_schemas.py    # Draft body validation and normalization
 │       ├── event_router.py     # Receives webhook events, triggers automations
+│       ├── factory_router.py   # Factory CRUD (named groups of automations)
 │       ├── exceptions.py       # Transient vs terminal failure exceptions
 │       ├── execution.py        # Sandbox lifecycle: create → upload → execute → delete
 │       ├── filter_eval.py      # JMESPath-based filter evaluation for event matching
@@ -67,10 +70,12 @@ automation/
 │       ├── router.py           # API routes (CRUD, trigger, callback, runs list)
 │       ├── scheduler.py        # Cron scheduler — polls automations, creates PENDING runs
 │       ├── schemas.py          # Pydantic request/response schemas
+│       ├── service_router.py   # Service-key routes for Enterprise (factory lookup)
 │       ├── subjects.py         # Maps an external subject to a conversation id
 │       ├── telemetry.py        # PostHog product telemetry (+ telemetry_router.py)
 │       ├── trigger_matcher.py  # Trigger matching for event-based automations
 │       ├── uploads.py          # Tarball upload router
+│       ├── usage_router.py     # Instance-wide totals for the OpenHands server's usage report
 │       ├── watchdog.py         # Staleness watchdog — marks hung runs as FAILED
 │       ├── webhook_router.py   # Custom webhook CRUD
 │       ├── backends/           # Execution backends (Cloud, Local)
@@ -165,6 +170,7 @@ OPENHANDS_API_KEY=sk-oh-... uv run python scripts/test_automation.py --api-url h
 
 - Cloud product events use the server-authoritative Cloud user ID as the PostHog `distinct_id`; never trust a client telemetry header as Cloud identity.
 - Local Agent Canvas requests carry their consented PostHog identity in `X-OpenHands-Telemetry-Distinct-Id`. Store that value on newly created automations and runs so asynchronous lifecycle events retain the same identity.
+- `AUTOMATION_TELEMETRY_DEPLOYMENT_MODE` (`local` | `cloud` | `self_hosted`) overrides the `deployment_mode` / `deployment_kind` event labels; self-hosted Enterprise runs in cloud mode but must report `self_hosted` / `local`. Every `automation_created` capture also carries `automation_name` and `is_first_automation_in_org` (see `automation_created_properties`). Self-hosted deployments send it as `ohe_automation_created` (see `automation_created_event`).
 - Local events with no Canvas attribution fall back to the DB-backed automation backend ID. Keep `automation_backend_id` as an event property for installation analysis rather than substituting it for a known person identity.
 - Local consent is stored per frontend distinct ID. Attributed events require consent for their resolved identity; only unattributed backend-level events use the aggregate installation consent.
 
@@ -181,14 +187,13 @@ mkdir -p .pr
 └── notes.md        # Any other PR-specific content
 ```
 
-The `PR Artifacts` workflow warns reviewers when `.pr/` exists on a PR. After a PR merges to `main`, the workflow opens or updates a cleanup PR to remove the directory, for both same-repository and fork PRs. Approval does not modify the source PR or rerun its CI just to remove temporary artifacts.
+The `PR Artifacts` workflow warns reviewers when a PR adds or changes files under `.pr/`. After a same-repository or fork PR merges to `main`, the next release PR update removes the directory from `main` in the same push as its version bump (`cleanup-pr-artifacts` in `.github/workflows/release.yml`). No separate cleanup PR is opened, and the source PR is not modified.
 
 Important notes:
 
 - Do not put anything in `.pr/` that needs to be preserved.
 - The `.pr/` check is informational during development; it posts a notice rather than blocking the PR.
-- Release-please PRs fail the required `unit-tests` check while their committed tree contains `.pr/`. Merge the cleanup PR and let release-please update the release PR before merging it.
-- Cleanup PRs follow the normal review and required-check protections for `main`.
+- Release-please PRs fail the required `unit-tests` check while their committed tree contains `.pr/`. Refresh the release PR by rerunning the latest `release` workflow on its target branch, then let the check rerun before merging.
 
 
 ## Dispatch Pipeline
@@ -196,13 +201,15 @@ Important notes:
 The dispatcher uses a **fire-and-forget** model. For each PENDING run:
 
 1. **Fetch per-user API key** — `get_api_key_for_automation_run()` mints a key via the service key
-2. **Resolve tarball** — Internal (`oh-internal://`) downloads from GCS; external (HTTP) URLs are downloaded inside the sandbox
+2. **Resolve tarball** — Internal (`oh-internal://`) downloads from GCS; external (HTTP) URLs are downloaded inside the sandbox. A prompt or plugin preset tarball gets the service's current runner (`main.py`, `setup.sh`, `finish_tool_hook.py`) in place of the one baked in at creation (`with_current_preset_runner`); the stored tarball is not rewritten
 3. **Create sandbox** — `POST /api/v1/sandboxes` (Cloud API, Bearer token auth)
 4. **Wait for RUNNING** — Poll `GET /api/v1/sandboxes?id=<id>` until status=RUNNING
 5. **Upload/download tarball** — `POST /api/file/upload/<path>` (agent-server) or `curl` inside sandbox
-6. **Start entrypoint** — `POST /api/bash/start_bash_command` (agent-server)
-   - Extracts tarball, runs setup.sh (if present), exports env vars, runs entrypoint
-7. **Return immediately** — Dispatcher does not wait for completion
+6. **Start the conversation through the app server** (cloud mode; prompt and plugin presets, plugin-spec conversation runs) — `POST /api/v1/app-conversations` with the run's `sandbox_id`, the automation's `agent_profile_id` (else the owner's active profile), the run tags and, for plugin runs, the plugins. Presets also pass a finish-required plugin the service writes into the sandbox and, when their runner supports it, the repositories the app server can clone (`selected_repository`, `additional_repositories`): those on a provider and host the owner is connected to, from `provider_tokens_set` in `GET /api/v1/settings`. The runner clones the rest, and all of them if that read fails. The app server applies the owner's profile, MCP servers and secrets as it does for a chat, and the service checks `launched_agent_profile`. An app server without this contract (a missing route or a body it cannot validate) logs `conversation_start_fallback` and the runner creates the conversation as before, unless the automation selected an agent profile: only the app server can launch one, so that run fails with `agent_profile_unsupported`. Any other refusal fails the run. Local mode and custom tarballs skip this step.
+7. **Start entrypoint** — `POST /api/bash/start_bash_command` (agent-server)
+   - Extracts tarball, runs the setup script (the automation's `setup_script_path`; the default root `setup.sh` is skipped when absent, any other path must exist), exports env vars, runs entrypoint. Plugin-spec runs always use the bundle's root `setup.sh` wrapper
+   - Native Windows local mode (the run's work dir is a drive path): the agent-server runs commands with cmd.exe, so the tarball, a JSON spec (env vars + entrypoint) and `windows_runner.py` are uploaded into the work dir and `uv run --no-project python <runner> <spec>` does the same steps, running `setup.py` instead of `setup.sh`
+8. **Return immediately** — Dispatcher does not wait for completion
 
 Completion is handled asynchronously:
 - **Happy path**: SDK inside sandbox POSTs to `POST /v1/runs/{id}/complete` on the service (injected as `AUTOMATION_CALLBACK_URL`; the service serves it under the `/api/automation` base path)
@@ -214,14 +221,18 @@ Completion is handled asynchronously:
 |----------|--------|---------|
 | `OPENHANDS_API_KEY` | Per-user key issued via service key (cloud) | SDK auth for get_llm()/get_secrets() |
 | `OPENHANDS_CLOUD_API_URL` | Config (`openhands_api_base_url`, cloud) | Cloud API base URL |
-| `AGENT_SERVER_URL` | Local backend | Local agent-server URL from the sandbox's point of view |
-| `AUTOMATION_CALLBACK_API_KEY` | Local backend, when configured | Automation service key for local callbacks (not the agent-server session key) |
+| `AUTOMATION_RUN_MODE` | Both backends (`cloud` / `local`), and `run_automation()` (`cloud`) | Tells the preset scripts which workspace to use. `AGENT_SERVER_URL` never decides this, whether it is set or not. Without the variable (a service from 1.27.0 or earlier) the presets treat `SANDBOX_ID` as cloud and its absence as local |
+| `AGENT_SERVER_URL` | Local backend only; never exported into a cloud sandbox | Agent-server URL from the sandbox's point of view. Scripts stored in existing automations (catalog bundles, scripts written from the openhands-automation skill, preset runners from 1.27.0 and earlier) read its presence as "local Agent Canvas", so a cloud run must not get it |
+| `AUTOMATION_CALLBACK_API_KEY` | Local backend, when configured; cloud dispatcher and `run_automation()` (the per-user key) | Key for signing the completion callback (local: the automation service key, not the agent-server session key; cloud: the same key as `OPENHANDS_API_KEY`) |
 | `SANDBOX_ID` | Cloud sandbox creation response | SDK reads for settings API calls |
 | `SESSION_API_KEY` | Cloud sandbox creation response or local backend | SDK reads for settings API auth |
+| `AUTOMATION_FACTORY_TOKEN` | Dispatcher, cloud mode only, when the automation belongs to a factory and the service key is set | Run token naming the run's factory, for services that hold the service key (see Factory references from other services). Absent in local mode, for an automation with no factory, and without a service key; the run starts anyway |
 | `AUTOMATION_CALLBACK_URL` | Constructed by dispatcher | SDK posts completion status here |
 | `AUTOMATION_RUN_ID` | Run ID | Included in callback payload |
 | `AUTOMATION_EVENT_PAYLOAD` | Trigger context JSON | Available to user's script; preset scripts also use it to set a descriptive conversation title |
-| `AUTOMATION_CONVERSATION_ID` | Derived by the service, `continue_conversation` runs only | The id the script must give its conversation, so a later event on the same subject reaches it. A custom script that ignores it gets a fresh conversation per event |
+| `AUTOMATION_CONVERSATION_ID` | Derived by the service for `continue_conversation` runs; the started conversation's id when the app server started it | The id the script must give its conversation, so a later event on the same subject reaches it. A custom script that ignores it gets a fresh conversation per event |
+| `AUTOMATION_CONVERSATION_STARTED` | `app_server`, cloud mode, when the service started the conversation | The stock runners attach to `AUTOMATION_CONVERSATION_ID` with `RemoteConversation.attach` instead of building an agent and creating it, and register it with the workspace so the completion callback reports it as the run's conversation. Absent otherwise |
+| `AUTOMATION_RUNNER_REPOS` | JSON list, set with `AUTOMATION_CONVERSATION_STARTED` when the app server cloned some of a preset's repositories | The repositories the preset runner still clones itself; without it the runner clones every entry of `repos_config.json` |
 
 The SDK's `OpenHandsCloudWorkspace(local_agent_server_mode=True)` reads `SANDBOX_ID`, `SESSION_API_KEY`, and `AGENT_SERVER_PORT` from env vars automatically.
 
@@ -229,7 +240,7 @@ The SDK's `OpenHandsCloudWorkspace(local_agent_server_mode=True)` reads `SANDBOX
 
 - **Callback auth**: The completion endpoint (`/runs/{id}/complete`) uses `authenticate_request`. Cloud runs use the per-user `OPENHANDS_API_KEY`; local runs use `AUTOMATION_CALLBACK_API_KEY` when configured (the service's local API key, not the agent-server session key). The authenticated user must own the run's parent automation.
 - **Optimistic locking**: Both callback endpoint and watchdog use `UPDATE ... WHERE status = 'RUNNING'` and check `CursorResult.rowcount` to handle races. Returns 409 on conflict.
-- **Sandbox cleanup**: On callback, sandbox is deleted in a fire-and-forget background task (unless `keep_alive=True`); when `AUTOMATION_SANDBOX_CLEANUP_DELAY_SECONDS` > 0 it is paused instead and the watchdog deletes it once `automation_runs.sandbox_cleanup_due_at` passes. On dispatch failure, the dispatcher deletes the sandbox immediately.
+- **Sandbox cleanup**: On callback (unless `keep_alive=True`), the sandbox keeps running for `AUTOMATION_SANDBOX_EVENT_FLUSH_GRACE_SECONDS` (default 35) so its agent server can post the conversation's last buffered events to the app server (it flushes a partial batch only after 30 s idle). The watchdog then deletes it once `automation_runs.sandbox_cleanup_due_at` passes; when `AUTOMATION_SANDBOX_CLEANUP_DELAY_SECONDS` > 0 it is paused after the grace period and deleted after the delay. With both at 0 it is deleted at once. On dispatch failure, the dispatcher deletes the sandbox immediately.
 
 ## Database
 
@@ -272,6 +283,92 @@ def upgrade() -> None:
 
 - **Locking patterns**: `FOR UPDATE SKIP LOCKED` in scheduler/dispatcher — check `using_sqlite()` to skip on SQLite
 
+## Factories
+
+A factory is a named group of automations: `factories` (`id`, `org_id`, `name`,
+timestamps) plus a nullable `automations.factory_id` (`ON DELETE SET
+NULL`). Zero factories is a valid state; there is no default factory.
+
+- Factories are addressed by id (`/v1/factories/{id}`), like automations. Names
+  need not be unique and there is no slug. A rename changes only `name`.
+- `id` is never reused. Other services keep it as a plain reference with no
+  foreign key, because their data lives in other databases.
+- Read routes need `view_automations`; creating, renaming and deleting a
+  factory, and *changing* an automation's factory, need `manage_automations`.
+  `authorize_factory_change` is the one check (403 without the permission, 404
+  for an unknown or other-org factory): `POST /v1`, `/v1/plugin-spec`,
+  `/v1/preset/prompt` and `/v1/preset/plugin` run it when `factory_id` is set,
+  `PATCH /v1/{id}` only when the value differs from the stored one (resending
+  it or `null` on an automation with no factory is not a change), and the draft
+  validators report it as a `factory_id_403`/`factory_id_404` error. Drafts store
+  `factory_id`, but their hidden test-run automation never gets it.
+- Membership gives an automation access to its factory's data, so the creator
+  exception of `_assert_can_manage` stops at the factory: any `PATCH` of an
+  automation that is in a factory needs `manage_automations`. A draft's hidden
+  test-run automation cannot be put in a factory (`PATCH` returns 409).
+- Re-enabling an installed template (`template` on a create endpoint) returns
+  the existing automation unchanged; if the request names a `factory_id` the
+  automation is not in, it is `409` rather than silently ignored. Move it with
+  `PATCH`.
+- Deleting a factory returns `409` while a live automation belongs to it.
+  Otherwise one transaction detaches its soft-deleted automations (through the
+  ORM, so the change audit records it) and removes the row with a single
+  conditional `DELETE ... WHERE NOT EXISTS (live member)`.
+- Assigning takes `lock_factory_for_assignment` right before the write, not
+  before the slow lookups: `FOR KEY SHARE` on PostgreSQL (conflicts with the
+  delete's `FOR UPDATE`, not with a rename), a no-op write on SQLite to take its
+  write lock. The delete-versus-assign race is tested with per-request sessions
+  (`race_client` in `tests/test_factories.py`); the shared-session `async_client`
+  cannot show it.
+- Git sync neither writes nor reads `factory_id`: a factory's id is
+  local to an install. The `PATCH` rule above is enforced at the API only. Git
+  sync, plugin refs and external tarball URLs are trusted as the source of an
+  automation's code, so whoever controls them controls what runs in a factory.
+
+### Factory references from other services
+
+Other services keep a factory's id as a plain reference with no foreign key,
+because their data lives in other databases. This service supplies the three
+things such a holder needs. The first consumer is worklogs (append-only logs
+scoped to a factory), which the OpenHands server stores and serves
+(OpenHands/enterprise#1297); nothing here is specific to them.
+
+- **Run token** (`utils/factory_token.py`): the dispatcher injects
+  `AUTOMATION_FACTORY_TOKEN` next to `AUTOMATION_KV_TOKEN`. It is an HS256 JWT
+  signed with a key derived from `AUTOMATION_SERVICE_KEY` by HKDF-SHA256 (zero
+  salt, 32 bytes, info `openhands-factory-run-token-v1`); the raw service key
+  never signs. Claims: `aud` `factory`, `org_id`, `factory_id`,
+  `automation_id`, `automation_name` (at most 256 characters), `run_id`, `iat`,
+  `exp` (24 hours by default; `AUTOMATION_FACTORY_TOKEN_TTL_SECONDS` changes it
+  and Enterprise reads only `exp`; keep it above the longest possible run). The
+  token is never stored, logged or put in `AUTOMATION_EVENT_PAYLOAD`. A run
+  keeps the factory named in its token until it expires, even if its automation
+  is moved to another factory mid-run, and even if the factory is deleted:
+  deleting a factory only needs no live members, so a RUNNING run of a
+  soft-deleted or moved automation can still write under the old id after the
+  `deleted` notification, until the receiver's orphan purge runs. A run
+  sends it as a Bearer token to a route of a service that accepts it, which
+  decides what the factory may do (Enterprise's worklog routes are the first).
+  The token carries the authority of the automation's code: whoever controls
+  what a factory member runs can use it. `PATCH` of a member needs
+  `manage_automations` (see Factories), but git sync, plugin refs and external
+  tarball URLs are trusted as the source of that code. A draft's hidden
+  test-run automation cannot be in a factory, so it never gets a token.
+  Only a service that holds the service key can verify it. The tests in
+  `tests/test_factory_token.py` commit the contract test vector that
+  Enterprise's tests also commit; if the two differ, the enterprise issue is
+  authoritative.
+- **Factory lookup**: `GET /v1/service/factories?org_id=&id=...` (up to 100
+  ids), authenticated with `X-Service-API-Key` like `usage_router`. It tells a
+  service that stores a factory id whether the factory exists.
+- **Delete notification**: so a service can remove its data for a deleted
+  factory. After a factory delete commits, `POST
+  {openhands_api_base_url}/api/service/orgs/{org_id}/factories/{factory_id}/deleted`
+  (`notify_factory_deleted`). Worklogs are the only consumer today. Any answer
+  but 204, or any failure to send, is a warning naming the org, the factory
+  and the URL; it never blocks the delete. Skipped in local mode. Enterprise's
+  maintenance task repairs a missed notification, so there is no retry queue.
+
 ## Preset-Based Automation Creation
 
 Presets are ready-to-use automation configurations where users provide arguments (like a prompt) instead of writing SDK scripts.
@@ -290,6 +387,8 @@ The `/v1/preset/prompt` endpoint allows creating automations by simply providing
    - `setup.sh` - SDK installation script
 4. Uploads the tarball to storage (creates `TarballUpload` record)
 5. Creates the `Automation` record referencing the internal upload
+
+Each run swaps in the current `main.py`, `setup.sh` and `finish_tool_hook.py`, so an automation created on an earlier release runs today's runner with its own prompt and repository configuration.
 
 #### Files
 
@@ -312,7 +411,39 @@ The `/v1/preset/prompt` endpoint allows creating automations by simply providing
 
 - The `presets/` directory is excluded from ruff and pyright linting since it contains SDK code that runs in the sandbox, not application code
 - Generated presets use `.venv/bin/python main.py` on POSIX (`.venv/Scripts/python.exe main.py` on Windows) as the entrypoint and `setup.sh` as the setup script
+- Prompt and plugin preset tarballs created on Windows also carry `presets/setup.py`, the Python counterpart of their `setup.sh`; keep the two in step
 - Prompt and plugin presets live in separate subdirectories under `openhands/automation/presets/`
+
+## Private Plugin Sources
+
+A plugin-spec automation (and a plugin preset pinned for a service account)
+can use a plugin from a private repository. The source names its credential
+with a `${NAME}` placeholder as the URL user name or password, for example
+`https://x-access-token:${GITHUB_TOKEN}@github.com/org/plugins.git`. It is
+stored and returned with the placeholder; literal credentials are rejected
+(`AutomationPluginSource.validate_source`), and so are placeholders anywhere
+else in the source or in `ref`.
+
+- Every fetch resolves `NAME` for the identity the automation runs as and
+  hands the SDK `LookupSecret` references, never a value
+  (`plugin_secrets.py`): the create and PATCH preflight, the dispatch preflight,
+  `validate_required_plugins`, and the agent server's `POST /api/plugins/fetch`
+  (fresh references, after the sandbox starts).
+- Local mode resolves through the agent server's secret store,
+  `/api/settings/secrets/{name}`; the agent server's own reference uses
+  `AUTOMATION_SANDBOX_AGENT_SERVER_URL` when set.
+- Cloud mode asks the app server for short-lived references,
+  `POST /api/service/users/{user_id}/orgs/{org_id}/secret-lookups` with the
+  service key. A server without that route answers 404 `Not Found`, and the
+  source is refused with "not supported on this deployment yet".
+- `missing_secret`, `auth_failed`, `invalid_source` and refused lookups are
+  permanent and disable the automation; an unreachable lookup is transient.
+  Errors name the secret, never its value.
+- A conversation-runner run then has the app server start its conversation
+  with the same plugin spec, placeholder included (`_conversation_start`). The
+  sandbox's agent server fills the placeholder from the conversation's secrets,
+  which the app server may scope to the agent profile, and uses the checkout
+  the fetch pinned.
 
 ## Catalog Bundles
 
@@ -327,7 +458,10 @@ path gained is the catalog contract the presets already had:
 - **`template` provenance** (`TemplateProvenance` in `schemas.py`), accepted by
   all three creation endpoints and stored under `preset_metadata["template"]`.
   `find_existing_template_automation` (`utils/templates.py`) is consulted first,
-  so enabling an entry twice returns the existing automation with a 200.
+  so a member enabling an entry twice gets their existing non-draft automation
+  back with a 200 (a draft test's hidden DRAFT artifact is not an install).
+  The lookup is per member (`created_by_user_id`), not per org: another
+  member enabling the same entry gets their own automation, running as them.
   `record_first_run_outcome` keys on the same value, so bundles get first-run
   telemetry for free.
 - **Preflight**: `POST /v1/validate` accepts `"endpoint": "/v1"`. It validates
@@ -381,6 +515,7 @@ exactly one org, the deterministic local org from `auth.py`'s
   extracted files are committed as plain content and the mode would otherwise
   be lost on the way back in. Slugs are unique per org
   (`AutomationGitSyncState`, `(org_id, slug)`), not globally.
+- Plugin-spec automations also store `plugin_spec` (source, config and pinned required plugins) in `automation.yaml`, with `plugin-spec://runtime` as the source marker and no tarball files. Import validates the stored shape; execution preflight still fetches the manifest and validates its config schema using the run identity. Existing profile and secret references must be available on the destination. Older exports missing the spec are repaired from the live record on the next sync.
 - `git_sync_path` is validated by `normalize_git_sync_path`: repo-relative, no
   `..`, no leading/trailing slashes, never empty. It is joined onto the local
   checkout and passed to `git add -- <path>`, and each slug directory under it
@@ -562,8 +697,25 @@ and `app.py` version lines.
 
 ### SDK dependency bumps
 
-When bumping `openhands-sdk` / `openhands-workspace` pins:
+The `bump-pins` workflow (`.github/workflows/bump-pins.yml`, a caller of the
+reusable workflow in `OpenHands/release-actions`) opens a `fix: bump SDK to <ver>`
+PR from the `bump-pins` branch when a newer SDK release is on PyPI, and rebuilds
+that branch when the next one is. Run it by hand from the Actions tab if needed.
+
+To bump the `openhands-sdk` / `openhands-workspace` pins by hand instead:
 1. Update both versions in `pyproject.toml` dependencies.
 2. Run `uv lock` to regenerate `uv.lock`.
 3. Open a Conventional Commit PR (e.g. `fix: bump SDK to <ver>`) and squash-merge it —
    release-please handles the version bump and release.
+
+## SDK 1.63 dependency compatibility
+
+- Keep LiteLLM `>=1.108.3,<1.109` with SDK/workspace 1.63: LiteLLM 1.109
+  removed `litellm.llms.openai.chat.gpt_5_transformation`, which SDK imports
+  during startup. Keep the security floor `filelock>=4.2.1` when resolving.
+- SDK 1.63 requires Pydantic >=2.14.3. Its TypeAdapter uses TypeForm; use
+  pyright >=1.1.414 rather than ignoring Trigger argument errors or forcing
+  an incompatible Pydantic downgrade. Explicit TTLCache constructor generics
+  keep cachetools inference consistent with that checker.
+- All-files pre-commit launches multiple pyright processes. On memory-constrained
+  hosts, run whole-project `uv run pyright` once and lint checks sequentially.

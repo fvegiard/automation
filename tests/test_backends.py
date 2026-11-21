@@ -21,8 +21,10 @@ from openhands.automation.backends.local import (
     local_runs_root,
     resolve_local_workspace_base,
 )
+from openhands.automation.config import clear_config_cache
 from openhands.automation.exceptions import (
     ConcurrencyLimitReachedError,
+    LicenseLimitReachedError,
     SandboxProvisioningError,
 )
 
@@ -134,6 +136,8 @@ class TestLocalAgentServerBackend:
             callback_api_key="automation-service-key",
         )
         env_vars = backend.build_env_vars()
+        # The presets pick local mode from this, not from AGENT_SERVER_URL (#688)
+        assert env_vars["AUTOMATION_RUN_MODE"] == "local"
         # WORKSPACE_BASE should be run-isolated (includes run_id)
         assert env_vars["AGENT_SERVER_URL"] == "http://localhost:3000"
         assert env_vars["SESSION_API_KEY"] == "agent-server-key"
@@ -356,33 +360,44 @@ class TestCloudSandboxBackend:
         )
         assert backend.api_url == "https://app.all-hands.dev"
 
-    def test_find_agent_server_url_found(self):
-        """_find_agent_server_url extracts agent URL from sandbox response."""
-        sandbox = {
-            "exposed_urls": [
-                {"name": "OTHER", "url": "http://other.example.com"},
-                {"name": "AGENT_SERVER", "url": "http://agent.example.com/"},
-            ],
-            "session_api_key": "session-key",
-        }
-        result = CloudSandboxBackend._find_agent_server_url(sandbox)
-        assert result == ("http://agent.example.com", "session-key")
+    @pytest.mark.asyncio
+    async def test_create_and_wait_uses_sandbox_internal_url(
+        self, mock_run, monkeypatch
+    ):
+        """The agent URL points at AUTOMATION_SANDBOX_INTERNAL_URL when set."""
+        monkeypatch.setenv("AUTOMATION_SANDBOX_INTERNAL_URL", "http://proxy")
+        clear_config_cache()
 
-    def test_find_agent_server_url_not_found(self):
-        """_find_agent_server_url returns None if no AGENT_SERVER URL."""
-        sandbox = {
-            "exposed_urls": [
-                {"name": "OTHER", "url": "http://other.example.com"},
-            ],
-        }
-        result = CloudSandboxBackend._find_agent_server_url(sandbox)
-        assert result is None
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                return httpx.Response(200, json={"id": "sb1"})
+            sandbox = {
+                "id": "sb1",
+                "status": "RUNNING",
+                "session_api_key": "session-key",
+                "exposed_urls": [
+                    {
+                        "name": "AGENT_SERVER",
+                        "url": "http://localhost:9043/runtime/oh-agent-server-abc/8000",
+                    }
+                ],
+            }
+            return httpx.Response(200, json=[sandbox])
 
-    def test_find_agent_server_url_empty(self):
-        """_find_agent_server_url handles empty exposed_urls."""
-        sandbox = {"exposed_urls": None}
-        result = CloudSandboxBackend._find_agent_server_url(sandbox)
-        assert result is None
+        backend = CloudSandboxBackend(api_url="https://app.test", run=mock_run)
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            ) as client:
+                result = await backend._create_and_wait(client, "key")
+        finally:
+            clear_config_cache()
+
+        assert result == (
+            "sb1",
+            "session-key",
+            "http://proxy/runtime/oh-agent-server-abc/8000",
+        )
 
     @pytest.mark.asyncio
     async def test_get_api_key_mints_per_user_key(self, mock_run):
@@ -412,9 +427,12 @@ class TestCloudSandboxBackend:
             await backend.get_api_key()
 
             env_vars = backend.build_env_vars()
+            # AUTOMATION_RUN_MODE is what the presets read to pick cloud mode
+            # (#688); a cloud run never gets AGENT_SERVER_URL.
             assert env_vars == {
                 "OPENHANDS_API_KEY": "sk-user",
                 "OPENHANDS_CLOUD_API_URL": "https://app.all-hands.dev",
+                "AUTOMATION_RUN_MODE": "cloud",
             }
 
     def test_build_env_vars_raises_without_api_key(self, mock_run):
@@ -627,6 +645,53 @@ class TestCloudSandboxConcurrencyLimit:
 
         # No retry: the sandbox API was hit exactly once.
         assert client.post.await_count == 1
+
+
+class TestCloudSandboxLicenseLimit:
+    """Tests that `_create_sandbox` surfaces the refusal of an OpenHands
+    Enterprise install without a valid license as `LicenseLimitReachedError`."""
+
+    API = "https://app.all-hands.dev"
+
+    @staticmethod
+    def _backend() -> CloudSandboxBackend:
+        run = MagicMock()
+        run.sandbox_id = None
+        run.bash_command_id = None
+        return CloudSandboxBackend(api_url=TestCloudSandboxLicenseLimit.API, run=run)
+
+    @staticmethod
+    def _client(detail) -> MagicMock:
+        req = httpx.Request(
+            "POST", f"{TestCloudSandboxLicenseLimit.API}/api/v1/sandboxes"
+        )
+        client = MagicMock()
+        client.post = AsyncMock(
+            return_value=httpx.Response(402, request=req, json={"detail": detail})
+        )
+        return client
+
+    @pytest.mark.asyncio
+    async def test_create_sandbox_raises_and_does_not_retry(self):
+        """The 402 carries the reason to show, and a retry cannot succeed until
+        the install has a license."""
+        message = "Only the first Super Admin can start conversations."
+        client = self._client({"error": "LICENSE_LIMIT_REACHED", "message": message})
+
+        with pytest.raises(LicenseLimitReachedError) as exc_info:
+            await self._backend()._create_sandbox(client, {"Authorization": "Bearer x"})
+
+        assert str(exc_info.value) == message
+        assert client.post.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_create_sandbox_keeps_another_402_an_http_error(self):
+        """Only the license code marks the refusal; any other 402 fails the
+        run as before."""
+        client = self._client("Payment required")
+
+        with pytest.raises(httpx.HTTPStatusError):
+            await self._backend()._create_sandbox(client, {"Authorization": "Bearer x"})
 
 
 class TestCloudSandboxProvisioningFailure:

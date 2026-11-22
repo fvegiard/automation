@@ -30,7 +30,7 @@ dependencies = [
   "httpx>=0.27",
   "jmespath>=1.0",
   # SDK 1.63 imports gpt_5_transformation, removed in LiteLLM 1.109.
-  "litellm>=1.108.3,<1.109",
+  "litellm>=1.108.3,<1.110",
   "openhands-sdk==1.63.1",
   "openhands-workspace==1.63.1",
   "pg8000>=1.31",
@@ -82,7 +82,7 @@ dev = [
     "testcontainers[postgres,minio]>=4.10.0",
 ]
 production = [
-    "ddtrace==4.17.0",
+    "ddtrace==4.17.1",
 ]
 
 # Ruff configuration
